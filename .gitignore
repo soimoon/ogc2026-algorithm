@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# 대회 측이 배포한 인스턴스 JSON은 용량이 크고 organizer 자료라 굳이 커밋할 필요 없음
+# (경로만 로컬에 두고 참조)
+data/
+*_instances*/
+train-set*/
