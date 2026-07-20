@@ -36,67 +36,49 @@ from __future__ import annotations
 
 import time
 
-from baseline_greedy import _block_bbox, _candidate_positions, _find_earliest_slot, _placement_score
-from utils import Bay, Block, check_collisions
+from baseline_greedy import _top_candidates_for_block as _candidates_for_block
+from utils import Bay, Block, check_collisions, check_entry, check_exit
 
 
 def _time_overlaps(a0: float, a1: float, b0: float, b1: float) -> bool:
     return a0 < b1 and b0 < a1
 
 
-def _candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
-                          bay_placed: list[list[Block]],
-                          bay_schedule: list[list[tuple[int, int]]],
-                          bay_loads: list[float],
-                          w1: float, w2: float, w3: float,
-                          bay_weights: list[float],
-                          max_per_block: int,
-                          deadline: float | None) -> list[tuple]:
+def _crane_conflict(bay: Bay,
+                    blk_i: Block, entry_i: float, exit_i: float,
+                    blk_j: Block, entry_j: float, exit_j: float) -> bool:
     """
-    Enumerate up to max_per_block (score, bay_id, x, y, orient_idx, entry,
-    exit) candidates for block bi, using the same search
-    baseline_greedy._place_blocks already runs for Phase 1/2 -- just keeping
-    the top-N by _placement_score instead of only the single best, so the
-    MIP below has real alternatives to trade off against other blocks.
+    True if placing blk_i and blk_j together in the same bay would violate
+    the crane operation constraint (Stage 2/3 in utils.check_feasibility) at
+    any of the four moments where one could be present during the other's
+    crane operation. Presence windows mirror check_feasibility exactly:
+    "a_other < t < e_other" (strict both ends).
+
+    2026-07-20 bugfix: the pairwise conflict check in reinsert() below used
+    to call check_collisions() only -- steady-state spatial overlap. That
+    misses the case where two batch members' bounding footprints never
+    overlap in space at the same instant, but one's crane path (entering or
+    leaving) is swept-through-obstructed by a layer of the other at the
+    moment of that operation, which is a *different, stricter* rule (same-
+    or-higher-level layers, not just same-level). A batch that "solved"
+    without this check could still be rejected by check_feasibility right
+    after -- observed in testing as the identical block pair reappearing in
+    violations on the very next repair pass, cascading into forced
+    placement of unrelated blocks. See notes/algorithm_overview.md.
+
+    Blocks whose intervals are fully nested (neither is present at the
+    other's entry/exit boundary) don't need this check -- any steady-state
+    collision between them is already caught by check_collisions().
     """
-    r_time = blk_data["release_time"]
-    due = blk_data["due_date"]
-    proc = blk_data["processing_time"]
-    workload = blk_data["workload"]
-    prefs = blk_data["bay_preferences"]
-    s_max = max(prefs)
-
-    scored: list[tuple] = []
-    for bay_id, bay in enumerate(bays):
-        if deadline is not None and time.time() > deadline:
-            break
-        placed_in_bay = bay_placed[bay_id]
-        schedule_in_bay = bay_schedule[bay_id]
-        for oi, _ in enumerate(blk_data["shape"]):
-            blk_bb = _block_bbox(blk_data, oi)
-            candidates = _candidate_positions(bay.width, bay.height, placed_in_bay, blk_bb)
-            for cx, cy in candidates:
-                if deadline is not None and time.time() > deadline:
-                    break
-                new_blk = Block(block_id=bi, block_data=blk_data, x=cx, y=cy, orient_idx=oi)
-                if not bay.contains_block(new_blk):
-                    continue
-                entry, exit_t = _find_earliest_slot(
-                    new_blk, bay, placed_in_bay, schedule_in_bay,
-                    r_time, proc, deadline=deadline,
-                )
-                if entry is None:
-                    continue
-                tardiness = max(0.0, exit_t - due)
-                score = _placement_score(
-                    tardiness, workload, bay_loads, bay_id,
-                    s_max - prefs[bay_id], bay_weights, w1, w2, w3,
-                    top_y=cy + blk_bb[3],
-                )
-                scored.append((score, bay_id, cx, cy, oi, entry, exit_t))
-
-    scored.sort(key=lambda t: t[0])
-    return scored[:max_per_block]
+    if entry_j < entry_i < exit_j and check_entry(bay, [blk_j], blk_i, fast=True):
+        return True
+    if entry_i < entry_j < exit_i and check_entry(bay, [blk_i], blk_j, fast=True):
+        return True
+    if entry_j < exit_i < exit_j and check_exit(bay, [blk_j], blk_i, fast=True):
+        return True
+    if entry_i < exit_j < exit_i and check_exit(bay, [blk_i], blk_j, fast=True):
+        return True
+    return False
 
 
 def reinsert(remove_ids: list[int],
@@ -107,7 +89,7 @@ def reinsert(remove_ids: list[int],
             bay_loads: list[float],
             w1: float, w2: float, w3: float,
             deadline: float | None,
-            max_per_block: int = 8,
+            max_per_block: int = 20,
             solve_time_limit: int = 3) -> dict[int, dict] | None:
     """
     Jointly reinsert remove_ids via a small Xpress MIP.
@@ -117,6 +99,18 @@ def reinsert(remove_ids: list[int],
     feasible/optimal solution, or anything else goes wrong. None is a
     routine, expected outcome (not an error) -- callers must fall back to
     the existing greedy _place_blocks reinsertion whenever this returns None.
+
+    max_per_block was 8 originally; measured fallback rate in that config was
+    ~0% success on repair's blocking-chain batches (2026-07-20; see
+    notes/algorithm_overview.md). Likely cause: candidates are ranked
+    independently per block by _placement_score, with no awareness of the
+    OTHER batch member -- and a blocking-chain batch exists specifically
+    because the bay is contested there, so both blocks' top few candidates
+    tend to cluster in the same desirable spots and collide with each other,
+    even when a perfectly good joint arrangement exists further down each
+    block's own candidate list. Raised to 20 to give the solver more room to
+    find it; still small enough that the O(K^2 x max_per_block^2) pairwise
+    conflict-check cost stays cheap for the K<~6 batches seen in practice.
     """
     try:
         import xpress as xp
@@ -131,12 +125,16 @@ def reinsert(remove_ids: list[int],
         per_block: dict[int, list[tuple]] = {}
         for bi in remove_ids:
             if deadline is not None and time.time() > deadline:
+                print(f"[xpress_reinsert] DEBUG bail: deadline hit before candidates for block {bi} "
+                      f"(remaining={remove_ids})")
                 return None
             cands = _candidates_for_block(
                 bi, blocks_data[bi], bays, bay_placed, bay_schedule, bay_loads,
                 w1, w2, w3, bay_weights, max_per_block, deadline,
             )
             if not cands:
+                print(f"[xpress_reinsert] DEBUG bail: block {bi} has 0 candidates "
+                      f"(batch={remove_ids})")
                 return None  # this block has no feasible slot at all right now
             per_block[bi] = cands
 
@@ -164,7 +162,15 @@ def reinsert(remove_ids: list[int],
                                      x=cx_i, y=cy_i, orient_idx=oi_i)
                         blk_j = Block(block_id=bj, block_data=blocks_data[bj],
                                      x=cx_j, y=cy_j, orient_idx=oi_j)
-                        if check_collisions(bays[bay_i], [blk_i, blk_j]):
+                        # Two reasons a (candidate_i, candidate_j) pair can't
+                        # coexist: steady-state spatial overlap (same-level
+                        # collision) OR a crane operation obstruction (one's
+                        # entry/exit swept-blocked by the other's same-or-
+                        # higher layers) -- these are different rules and
+                        # both need checking, not just the first.
+                        if (check_collisions(bays[bay_i], [blk_i, blk_j])
+                                or _crane_conflict(bays[bay_i], blk_i, entry_i, exit_i,
+                                                   blk_j, entry_j, exit_j)):
                             prob.addConstraint(y[(bi, ci)] + y[(bj, cj)] <= 1)
 
         objective = xp.Sum(
@@ -177,11 +183,14 @@ def reinsert(remove_ids: list[int],
         if deadline is not None:
             remaining = max(1, min(solve_time_limit, int(deadline - time.time())))
             if remaining <= 0:
+                print(f"[xpress_reinsert] DEBUG bail: no time left before solve (batch={remove_ids})")
                 return None
         prob.controls.maxtime = remaining
         prob.controls.outputlog = 0
         prob.solve()
 
+        print(f"[xpress_reinsert] DEBUG solstatus={prob.attributes.solstatus} "
+              f"batch={remove_ids} n_candidates={[(bi, len(c)) for bi, c in per_block.items()]}")
         if prob.attributes.solstatus not in (xp.SolStatus.OPTIMAL, xp.SolStatus.FEASIBLE):
             return None
 
@@ -194,6 +203,7 @@ def reinsert(remove_ids: list[int],
                     chosen = cands[ci]
                     break
             if chosen is None:
+                print(f"[xpress_reinsert] DEBUG bail: no chosen candidate extracted for block {bi}")
                 return None
             _, bay_id, cx, cy, oi, entry, exit_t = chosen
             result[bi] = {
@@ -202,5 +212,8 @@ def reinsert(remove_ids: list[int],
                 "entry_time": int(round(entry)), "exit_time": int(round(exit_t)),
             }
         return result
-    except Exception:
+    except Exception as _dbg_exc:
+        import traceback
+        print(f"[xpress_reinsert] DEBUG raised: {_dbg_exc!r}")
+        traceback.print_exc()
         return None

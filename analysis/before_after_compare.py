@@ -1,0 +1,125 @@
+"""
+Compare two separate code snapshots (e.g. the actually-submitted zip vs the
+current working tree) on the same instances, to measure whether changes made
+since submission (blocking-chain-aware repair, Z2/Z3-aware Phase 3 selection,
+etc.) actually improve the objective -- not just "doesn't crash".
+
+Each version is run in its own subprocess with sys.path pointed at its own
+directory, so the two versions' same-named modules (myalgorithm,
+baseline_greedy, xpress_reinsert) never collide via Python's module cache
+the way they would in a single process.
+
+Usage:
+    python analysis/before_after_compare.py \
+        --before <dir_with_myalgorithm.py> --after <dir_with_myalgorithm.py> \
+        <instance.json | glob | dir> [...] [--timelimit 60]
+"""
+import argparse
+import glob as globmod
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RUNNER = r"""
+import sys, json
+sys.path.insert(0, {code_dir!r})
+import myalgorithm
+from utils import check_feasibility
+
+with open({instance_path!r}, encoding="utf-8") as f:
+    prob_info = json.load(f)
+
+sol = myalgorithm.algorithm(prob_info, timelimit={timelimit})
+result = check_feasibility(prob_info, sol)
+print("RESULT_JSON:" + json.dumps({{
+    "feasible": result["feasible"],
+    "objective": result.get("objective"),
+}}))
+"""
+
+
+def _collect_instance_files(patterns: list[str]) -> list[Path]:
+    files: list[Path] = []
+    for pattern in patterns:
+        p = Path(pattern)
+        if p.is_dir():
+            files.extend(sorted(p.glob("*.json")))
+        else:
+            files.extend(sorted(Path(m) for m in globmod.glob(pattern)))
+    seen = set()
+    unique = []
+    for f in files:
+        rp = f.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            unique.append(f)
+    return unique
+
+
+def _run_one(python_exe: str, code_dir: str, instance_path: str, timelimit: float) -> dict:
+    script = RUNNER.format(code_dir=code_dir, instance_path=instance_path, timelimit=timelimit)
+    proc = subprocess.run([python_exe, "-c", script], capture_output=True, text=True,
+                          timeout=timelimit + 60)
+    for line in proc.stdout.splitlines():
+        if line.startswith("RESULT_JSON:"):
+            return json.loads(line[len("RESULT_JSON:"):])
+    return {"feasible": False, "objective": None, "error": proc.stderr[-2000:]}
+
+
+def run(before_dir: str, after_dir: str, patterns: list[str], timelimit: float) -> None:
+    files = _collect_instance_files(patterns)
+    if not files:
+        print(f"No instance files matched: {patterns}")
+        sys.exit(1)
+
+    python_exe = sys.executable
+    print(f"Found {len(files)} instance file(s). timelimit={timelimit}s per (instance, version).")
+    print(f"before = {before_dir}")
+    print(f"after  = {after_dir}")
+    print("=" * 100)
+
+    before_wins = after_wins = ties = 0
+    for f in files:
+        t0 = time.time()
+        before = _run_one(python_exe, before_dir, str(f), timelimit)
+        t1 = time.time()
+        after = _run_one(python_exe, after_dir, str(f), timelimit)
+        t2 = time.time()
+
+        b_ok, b_obj = before["feasible"], before.get("objective")
+        a_ok, a_obj = after["feasible"], after.get("objective")
+
+        b_str = f"{b_obj:,.0f}" if b_ok and b_obj is not None else "INFEASIBLE"
+        a_str = f"{a_obj:,.0f}" if a_ok and a_obj is not None else "INFEASIBLE"
+
+        tag = ""
+        if b_ok and a_ok and b_obj is not None and a_obj is not None:
+            if a_obj < b_obj - 1e-6:
+                after_wins += 1
+                tag = "  <- after better"
+            elif b_obj < a_obj - 1e-6:
+                before_wins += 1
+                tag = "  <- BEFORE better (regression!)"
+            else:
+                ties += 1
+                tag = "  (tie)"
+        print(f"{f.name:16s}  before={b_str:>16s} ({t1-t0:5.1f}s)  "
+              f"after={a_str:>16s} ({t2-t1:5.1f}s){tag}")
+
+    print("=" * 100)
+    print(f"after better: {after_wins}   before better (regression): {before_wins}   tie: {ties}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("patterns", nargs="+",
+                        help="instance JSON file(s), glob pattern(s), or directory(ies)")
+    parser.add_argument("--before", required=True, help="directory containing the 'before' myalgorithm.py etc.")
+    parser.add_argument("--after", required=True, help="directory containing the 'after' myalgorithm.py etc.")
+    parser.add_argument("--timelimit", type=float, default=60.0,
+                        help="wall-clock time limit per (instance, version) in seconds (default: %(default)s)")
+    args = parser.parse_args()
+    run(args.before, args.after, args.patterns, args.timelimit)

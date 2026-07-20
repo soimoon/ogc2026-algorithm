@@ -8,3 +8,8 @@ __pycache__/
 data/
 *_instances*/
 train-set*/
+
+# built submission zips are derived artifacts (rebuildable from the tracked
+# .py files) -- keep the folder locally as a submission log/history, but no
+# need to commit the binaries themselves
+submissions/
