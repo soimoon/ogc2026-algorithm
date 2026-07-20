@@ -36,12 +36,37 @@ from __future__ import annotations
 
 import time
 
+from baseline_greedy import _block_bbox, _placement_score
 from baseline_greedy import _top_candidates_for_block as _candidates_for_block
 from utils import Bay, Block, check_collisions, check_entry, check_exit
 
 
 def _time_overlaps(a0: float, a1: float, b0: float, b1: float) -> bool:
     return a0 < b1 and b0 < a1
+
+
+def _current_position_candidate(bi: int, blk_data: dict, current_pos: tuple,
+                                bay_loads: list[float], bay_weights: list[float],
+                                w1: float, w2: float, w3: float) -> tuple:
+    """
+    Score a block's CURRENT (bay_id, x, y, orient_idx, entry, exit) as a
+    candidate tuple, in the same (score, bay_id, cx, cy, oi, entry, exit_t)
+    format _top_candidates_for_block returns -- see reinsert()'s
+    guarantee_current_position docstring for why this exists.
+    """
+    bay_id, cx, cy, oi, entry, exit_t = current_pos
+    due = blk_data["due_date"]
+    workload = blk_data["workload"]
+    prefs = blk_data["bay_preferences"]
+    s_max = max(prefs)
+    blk_bb = _block_bbox(blk_data, oi)
+    tardiness = max(0.0, exit_t - due)
+    score = _placement_score(
+        tardiness, workload, bay_loads, bay_id,
+        s_max - prefs[bay_id], bay_weights, w1, w2, w3,
+        top_y=cy + blk_bb[3],
+    )
+    return (score, bay_id, cx, cy, oi, entry, exit_t)
 
 
 def _crane_conflict(bay: Bay,
@@ -90,9 +115,18 @@ def reinsert(remove_ids: list[int],
             w1: float, w2: float, w3: float,
             deadline: float | None,
             max_per_block: int = 20,
-            solve_time_limit: int = 3) -> dict[int, dict] | None:
+            solve_time_limit: int = 3,
+            restrict_bay_id: int | None = None,
+            current_positions: dict[int, tuple] | None = None) -> dict[int, dict] | None:
     """
     Jointly reinsert remove_ids via a small Xpress MIP.
+
+    Despite the name, remove_ids need not have ever been placed before --
+    candidates are generated purely from the *other* blocks already present
+    in bay_placed/bay_schedule/bay_loads (see _top_candidates_for_block),
+    so this same function also serves as the joint-batch *insertion*
+    primitive for baseline_greedy._place_blocks_batched (Phase 1's
+    construction_mode="batched"), not just Phase 2/3 reinsertion.
 
     Returns {block_id: assignment_dict} on success, or None if Xpress is
     unavailable, any block has zero feasible candidates, the MIP finds no
@@ -111,6 +145,39 @@ def reinsert(remove_ids: list[int],
     block's own candidate list. Raised to 20 to give the solver more room to
     find it; still small enough that the O(K^2 x max_per_block^2) pairwise
     conflict-check cost stays cheap for the K<~6 batches seen in practice.
+
+    restrict_bay_id : optional (2026-07-20). Passed straight through to
+        _top_candidates_for_block -- when set, candidate generation only
+        searches that one bay per block instead of every bay, which is the
+        actual fix for bay-scoped joint reinsertion (e.g. "re-optimize this
+        whole bay's blocks together") not being able to even finish
+        generating candidates for large K (see analysis/bay_mip_probe.py --
+        the K=96 probe was searching all 4 bays per block, most of them
+        far more crowded than the target one, which was the real cost, not
+        the MIP solve). None (default) preserves existing all-bays
+        behaviour for every other caller unchanged.
+    current_positions : optional (2026-07-20), {block_id: (bay_id, x, y,
+        orient_idx, entry, exit_t)}. When a block_id has an entry here, its
+        CURRENT position is scored (via _placement_score, same formula as
+        every other candidate) and appended to that block's candidate list
+        if not already present -- guarantees at least one jointly-feasible
+        combination always exists whenever every block's current position is
+        provided (e.g. re-optimizing a whole bay's currently-placed blocks
+        together: "everyone stays exactly where they are" trivially has zero
+        pairwise conflicts, since that's how they were already arranged).
+        This does NOT bias the solver toward keeping blocks in place -- it's
+        still just one candidate among many, competing on the same score, so
+        anything that's actually a real improvement and doesn't conflict
+        with other picks is still preferred. It only prevents the solve from
+        going INFEASIBLE when a real combination is known to already exist
+        but didn't happen to make it into any block's independently-ranked
+        top max_per_block (2026-07-20: observed on analysis/bay_mip_probe.py
+        -- a 52-block whole-bay reinsertion came back solstatus=3/infeasible
+        even at max_per_block=40, because several blocks only had 2-8
+        geometrically valid candidates in that bay at all, and evidently
+        none of the independently-top-ranked combinations happened to be
+        mutually compatible). None (default) -- no guarantee added, existing
+        behaviour unchanged for every other caller.
     """
     try:
         import xpress as xp
@@ -131,7 +198,18 @@ def reinsert(remove_ids: list[int],
             cands = _candidates_for_block(
                 bi, blocks_data[bi], bays, bay_placed, bay_schedule, bay_loads,
                 w1, w2, w3, bay_weights, max_per_block, deadline,
+                restrict_bay_id=restrict_bay_id,
             )
+            if current_positions is not None and bi in current_positions:
+                current_cand = _current_position_candidate(
+                    bi, blocks_data[bi], current_positions[bi],
+                    bay_loads, bay_weights, w1, w2, w3,
+                )
+                already_present = any(
+                    c[1:] == current_cand[1:] for c in cands
+                )
+                if not already_present:
+                    cands = cands + [current_cand]
             if not cands:
                 print(f"[xpress_reinsert] DEBUG bail: block {bi} has 0 candidates "
                       f"(batch={remove_ids})")
@@ -185,7 +263,11 @@ def reinsert(remove_ids: list[int],
             if remaining <= 0:
                 print(f"[xpress_reinsert] DEBUG bail: no time left before solve (batch={remove_ids})")
                 return None
-        prob.controls.maxtime = remaining
+        # prob.controls.maxtime is an integer Xpress control -- int() guards
+        # against a caller passing a float solve_time_limit (maxtime would
+        # otherwise raise xpress.ModelError deep inside solve(), which
+        # looks like a solver failure rather than a caller type mismatch).
+        prob.controls.maxtime = int(remaining)
         prob.controls.outputlog = 0
         prob.solve()
 

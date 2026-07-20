@@ -49,9 +49,9 @@ def algorithm(prob_info, timelimit=60):
 
 def _solve(prob_info: dict, timelimit: float, t_start: float) -> dict:
     """
-    Try the real solver first; fall back to a guaranteed-feasible placement
-    if it crashes, or if what it returns does not actually pass
-    utils.check_feasibility.
+    Try the real solver first (with iterated-greedy restarts -- see below);
+    fall back to a guaranteed-feasible placement if it crashes, or if
+    nothing it returns actually passes utils.check_feasibility.
     """
     try:
         import baseline_greedy
@@ -62,17 +62,88 @@ def _solve(prob_info: dict, timelimit: float, t_start: float) -> dict:
         # but the server's hardware/load may differ from dev, so don't cut
         # this margin too thin.
         inner_timelimit = max(1.0, timelimit * 0.9)
-        candidate = baseline_greedy.greedyalgorithm(prob_info, timelimit=inner_timelimit)
-        result = check_feasibility(prob_info, candidate)
-        if result["feasible"]:
-            return candidate
-        print(f"[algorithm] baseline_greedy returned an infeasible solution "
-              f"(stage={result['stage']}) -- falling back to emergency placement.")
+        best_solution, best_objective, n_attempts = _iterated_greedy(
+            prob_info, baseline_greedy, check_feasibility,
+            deadline=t_start + inner_timelimit,
+        )
+        if best_solution is not None:
+            return best_solution
+        print(f"[algorithm] baseline_greedy returned no feasible solution across "
+              f"{n_attempts} restart attempt(s) -- falling back to emergency placement.")
     except Exception as exc:
         print(f"[algorithm] baseline_greedy raised {type(exc).__name__}: {exc} "
               f"-- falling back to emergency placement.")
 
     return _emergency_fallback(prob_info)
+
+
+# Restarts stop once the remaining budget drops below this floor -- below
+# it, a fresh Phase 1+2 pass isn't likely to finish, let alone leave any
+# room for Phase 3, so the time is better spent letting the current best
+# stand than gambling it on a rushed new attempt.
+_RESTART_MIN_BUDGET = 10.0
+# Purely a safety cap against a pathological case (e.g. a trivially-easy
+# instance where every attempt returns almost instantly) looping far more
+# than could plausibly help -- in practice, non-trivial instances consume
+# most of their budget in a single attempt (Phase 3 runs until the time
+# budget or a stall limit is hit), so this is rarely the binding constraint.
+_RESTART_MAX_ATTEMPTS = 5
+
+
+def _iterated_greedy(prob_info, baseline_greedy, check_feasibility, deadline: float):
+    """
+    Iterated-greedy diversification: call baseline_greedy.greedyalgorithm
+    repeatedly, each time with a different seed (so Phase 3's ALNS explores
+    a different sequence of destroy/rebuild decisions -- see
+    baseline_greedy.greedyalgorithm's seed docstring) and whatever time
+    budget remains, keeping the best feasible result seen.
+
+    Motivation: a single greedyalgorithm() call can plateau (Phase 3 stalls
+    out -- see baseline_greedy._improve's stall_limit) well before its time
+    budget is exhausted, e.g. observed on prob_5 where the pre-restart code
+    left tens of seconds of a 180s budget completely unused once local
+    search had nothing left to improve in *that* solution's neighbourhood.
+    A fresh construction/ALNS run from a different random seed is a
+    different starting basin for local search and can find improvements
+    the stalled run couldn't -- this is complementary to Phase 3's
+    within-run local search, not a replacement for it.
+
+    Naturally self-limiting: each attempt is given only the time actually
+    left (deadline - now), so on instances where a single attempt already
+    uses the whole budget, this loop runs exactly once -- identical
+    behaviour to before restarts existed.
+
+    Returns (best_solution_or_None, best_objective_or_None, n_attempts).
+    """
+    import time
+
+    best_solution = None
+    best_objective = None
+    attempt = 0
+
+    while attempt < _RESTART_MAX_ATTEMPTS:
+        remaining = deadline - time.time()
+        if remaining < _RESTART_MIN_BUDGET:
+            break
+        attempt += 1
+        seed = attempt - 1  # 0, 1, 2, ... -- deterministic across identical runs
+        candidate = baseline_greedy.greedyalgorithm(prob_info, timelimit=remaining, seed=seed)
+        result = check_feasibility(prob_info, candidate)
+        if not result["feasible"]:
+            print(f"[algorithm] restart {attempt} (seed={seed}): infeasible "
+                  f"(stage={result['stage']}) -- discarded.")
+            continue
+        objective = result["objective"]
+        if best_objective is None or objective < best_objective:
+            print(f"[algorithm] restart {attempt} (seed={seed}): NEW BEST "
+                  f"objective={objective:.0f}"
+                  + (f" (was {best_objective:.0f})" if best_objective is not None else ""))
+            best_solution, best_objective = candidate, objective
+        else:
+            print(f"[algorithm] restart {attempt} (seed={seed}): "
+                  f"objective={objective:.0f} (best stays {best_objective:.0f})")
+
+    return best_solution, best_objective, attempt
 
 
 def _emergency_fallback(prob_info: dict) -> dict:

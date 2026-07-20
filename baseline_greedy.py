@@ -328,12 +328,109 @@ def _find_earliest_slot(new_blk: Block,
     return None, None  # no valid time slot for this (position, bay) combination
 
 
+def _find_latest_slot(new_blk: Block,
+                      bay: Bay,
+                      placed_in_bay: list[Block],
+                      schedule_in_bay: list[tuple[int, int]],
+                      r_time: int,
+                      proc: int,
+                      latest_exit_bound: int,
+                      deadline: float | None = None) -> tuple[int | None, int | None]:
+    """
+    Mirror of _find_earliest_slot, searching backward instead of forward:
+    return the LATEST (entry, exit_t) with exit_t <= latest_exit_bound and
+    entry >= r_time at which new_blk can be crane-placed into bay. Returns
+    (None, None) if no candidate exit passes both checks.
+
+    2026-07-20, added for _right_justify (RCPSP right justification,
+    alternated with the existing _left_justify -- see that function's
+    docstring). The caller passes latest_exit_bound = the block's own
+    CURRENT exit_time, so this can only pull a block's exit EARLIER than (or
+    equal to) where it already is -- exactly like _find_earliest_slot can
+    only pull entry earlier than where a block already is -- never later,
+    so right-justifying can never make a schedule worse than it already is.
+
+    Candidate enumeration (descending): {latest_exit_bound} | {entry time of
+    every already-placed block in bay, if < latest_exit_bound} -- mirror of
+    _find_earliest_slot's forward candidates (which anchor on other blocks'
+    EXIT times); here we anchor on other blocks' ENTRY times, since walking
+    backward, another block's entry is where the crane path may become
+    newly obstructed as new_blk's own exit is pushed later.
+
+    Same Stage-2/3/4 feasibility checks as _find_earliest_slot (see that
+    function's docstring for what each stage catches), just walked in the
+    opposite direction.
+    """
+    candidate_exits = sorted(
+        {latest_exit_bound} | {a for a, _ in schedule_in_bay if a < latest_exit_bound},
+        reverse=True,
+    )
+
+    for exit_candidate in candidate_exits:
+        if deadline is not None and time.time() > deadline:
+            return None, None
+
+        exit_t = exit_candidate
+        entry = exit_t - proc
+        if entry < r_time:
+            continue  # can't start before release_time
+
+        # Stage-2: blocks already present when new_blk arrives.
+        present_at_entry = [
+            b for b, (a, e) in zip(placed_in_bay, schedule_in_bay)
+            if a < entry < e
+        ]
+        if check_entry(bay, present_at_entry, new_blk, fast=True):
+            continue
+
+        # Stage-3: blocks still present when new_blk departs.
+        present_at_exit = [new_blk] + [
+            b for b, (a, e) in zip(placed_in_bay, schedule_in_bay)
+            if a < exit_t < e
+        ]
+        if check_exit(bay, present_at_exit, new_blk, fast=True):
+            continue
+
+        # Stage-4+ pre-check -- see _find_earliest_slot's docstring.
+        s4_blocked = False
+        for b_other, (a_other, e_other) in zip(placed_in_bay, schedule_in_bay):
+            if entry < a_other < exit_t:
+                if check_entry(bay, [new_blk], b_other, fast=True):
+                    s4_blocked = True
+                    break
+            if entry < e_other < exit_t:
+                if check_exit(bay, [new_blk], b_other, fast=True):
+                    s4_blocked = True
+                    break
+            if (a_other >= entry and e_other <= exit_t
+                    and _time_overlaps(entry, exit_t, a_other, e_other)):
+                if check_collisions(bay, [new_blk, b_other]):
+                    s4_blocked = True
+                    break
+        if s4_blocked:
+            continue
+
+        return entry, exit_t
+
+    return None, None  # no valid time slot for this (position, bay) combination
+
+
 # -----------------------------------------------------------------------------
 # Shared helper: top-K scored candidates for a single block against a given
 # bay state. Used by _regret_construct (Phase 1) and xpress_reinsert.py
 # (Phase 3) -- both need "not just the single best, but the best few" for a
 # block, so this is factored out once instead of duplicated.
 # -----------------------------------------------------------------------------
+
+# How much of the pool's own score RANGE (worst candidate found - best
+# candidate found, for THIS block) a diversity substitution may cost, at
+# most -- see _top_candidates_for_block's 2026-07-21 revision note. Relative
+# to the pool's own range (not a fixed slot fraction, and not a fraction of
+# the raw score itself, which can be ~0 whenever tardiness+preference
+# penalty are both already 0 and Z2 dominates) so it scales automatically
+# with whatever w1/w2/w3 magnitudes and candidate spread a given instance
+# and block happen to have.
+CANDIDATE_DIVERSITY_MAX_DEGRADE_FRAC = 0.1
 
 def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
                               bay_placed: list[list[Block]],
@@ -342,12 +439,24 @@ def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
                               w1: float, w2: float, w3: float,
                               bay_weights: list[float],
                               max_per_block: int,
-                              deadline: float | None) -> list[tuple]:
+                              deadline: float | None,
+                              restrict_bay_id: int | None = None) -> list[tuple]:
     """
     Enumerate up to max_per_block (score, bay_id, x, y, orient_idx, entry,
     exit) candidates for block bi against the given bay state, sorted by
     _placement_score ascending (best first). Same search as _place_blocks'
     inner loop, just keeping the top-N instead of only the single best.
+
+    restrict_bay_id : optional (2026-07-20). When set, only that one bay is
+        searched instead of every bay. Motivation: callers that only care
+        about re-optimizing WITHIN a single bay (e.g. a bay-scoped joint
+        reinsertion) were paying the full per-block search cost across
+        EVERY other (often much more crowded) bay too, even though any
+        candidate outside restrict_bay_id would never be used -- this was
+        the actual reason a K=96 single-bay probe couldn't even finish
+        generating candidates in 300s (see analysis/bay_mip_probe.py and
+        notes/algorithm_overview.md), not the MIP solve itself. None
+        (default) preserves the original all-bays behaviour exactly.
     """
     r_time = blk_data["release_time"]
     due = blk_data["due_date"]
@@ -356,8 +465,11 @@ def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
     prefs = blk_data["bay_preferences"]
     s_max = max(prefs)
 
+    bay_ids_to_search = [restrict_bay_id] if restrict_bay_id is not None else range(len(bays))
+
     scored: list[tuple] = []
-    for bay_id, bay in enumerate(bays):
+    for bay_id in bay_ids_to_search:
+        bay = bays[bay_id]
         if deadline is not None and time.time() > deadline:
             break
         placed_in_bay = bay_placed[bay_id]
@@ -386,7 +498,79 @@ def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
                 scored.append((score, bay_id, cx, cy, oi, entry, exit_t))
 
     scored.sort(key=lambda t: t[0])
-    return scored[:max_per_block]
+
+    # 2026-07-20: dominance/diversity filtering instead of a plain top-N by
+    # raw score. Motivation: xpress_reinsert.reinsert()'s joint MIP gets one
+    # shot per block to resolve a conflict via a DIFFERENT candidate -- if
+    # the top max_per_block candidates are all near-duplicates (same bay,
+    # entry times a few time units apart), the solver has little real
+    # flexibility, since near-duplicates tend to conflict with the same
+    # other blocks. Bucket by (bay_id, entry_time // processing_time).
+    #
+    # 2026-07-21 rewrite: the slot-fraction approach (reserve a fixed share
+    # of slots for diversity, unconditionally discarding whatever plain
+    # top-by-score candidates land in that share) regressed prob_1 the same
+    # way its first version (2026-07-20) had already regressed prob_40 --
+    # confirmed by isolation testing (analysis/repeat_check.py-style A/B):
+    # a preference-mode joint reinsertion found a real -7,928 objective
+    # improvement with diversity-filling disabled and found NOTHING with it
+    # on, because the one candidate the joint MIP actually needed happened
+    # to rank just past the "core" cutoff and got swapped out for an
+    # unrelated, much-worse-scoring "diverse" candidate. A fixed slot
+    # fraction has no way to know whether that trade is cheap or ruinous.
+    # Bound the trade by its actual cost instead: start from the plain
+    # top-max_per_block by score (nothing discarded by default), and only
+    # ever substitute a candidate for a new-bucket alternative when (a) that
+    # bucket already has a spare duplicate within the current top-N (so the
+    # substitution never removes a bucket's only representative) and (b) the
+    # alternative's score is within CANDIDATE_DIVERSITY_MAX_DEGRADE_FRAC of
+    # this block's own candidate-score range. This can never make the pool
+    # worse than the plain top-N by more than that bounded amount, while
+    # still giving the joint MIP genuinely distinct alternatives when they're
+    # nearly free.
+    top = scored[:max_per_block]
+    if len(top) <= 1:
+        return top
+
+    bucket_width = max(1, proc)
+
+    def _bucket(c: tuple) -> tuple[int, int]:
+        return (c[1], int(c[5]) // bucket_width)
+
+    bucket_counts: dict[tuple[int, int], int] = {}
+    for c in top:
+        b = _bucket(c)
+        bucket_counts[b] = bucket_counts.get(b, 0) + 1
+    seen_buckets = set(bucket_counts)
+
+    best_score = top[0][0]
+    # 2026-07-21 bugfix: this must be the range WITHIN the kept top-N
+    # (top[-1] - best), not the worst candidate across the entire unbounded
+    # search -- using the full pool's range let one distant/bad candidate
+    # (e.g. a far bay with a large preference penalty) blow the budget wide
+    # open, making substitutions MORE permissive than intended (confirmed on
+    # prob_1: this bug made round 4's rejected objective 183,104 -- worse
+    # than both the old fixed-slot-fraction design AND diversity disabled
+    # entirely). Bounding to the top-N's own spread keeps the budget tied to
+    # candidates we were already willing to keep.
+    score_budget = max(1e-9, top[-1][0] - best_score) * CANDIDATE_DIVERSITY_MAX_DEGRADE_FRAC
+
+    result = list(top)
+    for cand in scored[max_per_block:]:
+        if cand[0] - best_score > score_budget:
+            break  # scored is sorted ascending -- nothing further can qualify
+        bucket = _bucket(cand)
+        if bucket in seen_buckets:
+            continue
+        for i in range(len(result) - 1, -1, -1):
+            worst_bucket = _bucket(result[i])
+            if bucket_counts[worst_bucket] > 1:
+                bucket_counts[worst_bucket] -= 1
+                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+                result[i] = cand
+                seen_buckets.add(bucket)
+                break
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -531,6 +715,46 @@ def _regret_construct(
 
 
 # -----------------------------------------------------------------------------
+# Construction-order diversification (for iterated-greedy restarts)
+# -----------------------------------------------------------------------------
+
+_CONSTRUCTION_SHUFFLE_WINDOW = 5
+
+
+def _perturb_construction_order(sorted_indices: list[int], seed: int | None) -> list[int]:
+    """
+    Lightly randomize a priority-sorted block order for construction
+    diversity across iterated-greedy restarts (see myalgorithm._iterated_greedy).
+
+    seed=0 or None returns sorted_indices completely unchanged -- this keeps
+    the seed=0 default (used everywhere else as "the" reproducible baseline:
+    single-shot greedyalgorithm() calls, analysis scripts, etc.) producing
+    byte-identical construction to before this function existed.
+
+    For any other seed, shuffles within a sliding window of
+    _CONSTRUCTION_SHUFFLE_WINDOW positions so each restart's Phase 1 starts
+    from a genuinely different concrete placement order -- not just a
+    different Phase 3 (ALNS) exploration path from the *same* Phase 1/2/2.5
+    result, which is all varying `seed` did before this (Phase 1's EDD sort
+    is otherwise fully deterministic, independent of seed -- see
+    notes/algorithm_overview.md's 2026-07-20 iterated-greedy entry).
+    Bounded to a small local window (not a full shuffle) so this stays close
+    to the empirically-validated EDD order rather than a random one -- only
+    ties/near-ties actually get reordered in practice, since due_date is
+    the dominant sort key and same-window blocks are usually close in it.
+    """
+    if not seed:
+        return sorted_indices
+    rng = random.Random(seed)
+    order = list(sorted_indices)
+    for start in range(0, len(order), _CONSTRUCTION_SHUFFLE_WINDOW):
+        chunk = order[start:start + _CONSTRUCTION_SHUFFLE_WINDOW]
+        rng.shuffle(chunk)
+        order[start:start + _CONSTRUCTION_SHUFFLE_WINDOW] = chunk
+    return order
+
+
+# -----------------------------------------------------------------------------
 # Main algorithm
 # -----------------------------------------------------------------------------
 
@@ -542,7 +766,10 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                     blocking_chain: bool = True,
                     z2z3_modes: bool = True,
                     left_justify: bool = True,
-                    seed: int | None = 0) -> dict:
+                    seed: int | None = 0,
+                    construction_mode: str = "serial",
+                    right_justify: bool = True,
+                    z23_relax: bool = True) -> dict:
     """
     ATC/EDD + Best-Fit Greedy algorithm with post-hoc feasibility repair and
     an anytime tardiness-improvement pass.
@@ -602,6 +829,18 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                     constant, not tuned/selected by which value scores best
                     on the local train instances (that would just be
                     overfitting a hyperparameter to local data).
+    construction_mode : "batched" (default, added 2026-07-20) -- Phase 1
+                    commits blocks in batches of PHASE1_BATCH_SIZE via
+                    xpress_reinsert.reinsert() (jointly optimized), falling
+                    back to the classic one-at-a-time _place_blocks per
+                    batch if Xpress is unavailable/fails/finds nothing.
+                    "serial" -- the original Serial-SGS behaviour (one block
+                    at a time, never revisited). Kept switchable so a
+                    regression can be ruled out/rolled back with a single
+                    flag flip; see _place_blocks_batched's docstring for the
+                    motivation (Serial SGS commits blocks with no visibility
+                    into blocks not yet placed, which is a structural cause
+                    of Phase 2/_repair ever being needed at all).
 
     Returns
     -------
@@ -640,9 +879,19 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     w2 = prob_info.get("weights", {}).get("w2", 1.0)
     w3 = prob_info.get("weights", {}).get("w3", 1.0)
 
+    # Z1's theoretical lower bound (see analysis/lower_bound.py): each
+    # block's own release_time+processing_time-due_date floor, ignoring
+    # every spatial/crane constraint -- no placement can ever beat this.
+    # O(n_blocks), negligible cost. Used by _improve to know when 'tardy'
+    # moves are provably futile (2026-07-20).
+    z1_lower_bound = sum(
+        max(0.0, b["release_time"] + b["processing_time"] - b["due_date"])
+        for b in blocks_data
+    )
+
     print(f"[Greedy] Instance : {prob_info.get('name', '?')}")
     print(f"[Greedy] Bays     : {n_bays}  |  Blocks : {n_blocks}  |  Timelimit : {timelimit:.1f}s")
-    print(f"[Greedy] Weights  : w1={w1}  w2={w2}  w3={w3}")
+    print(f"[Greedy] Weights  : w1={w1}  w2={w2}  w3={w3}  |  Z1 lower bound : {z1_lower_bound:.0f}")
     print(f"[Greedy] {'-' * 56}")
 
     bays = [Bay.from_dict(d, i) for i, d in enumerate(bays_data)]
@@ -705,6 +954,16 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     # Phase 1 construction plus more Phase 3 rounds empirically beats a
     # maximally-searched Phase 1 with almost no Phase 3 left.
     phase1_deadline = t_start + timelimit * 0.5
+    # 2026-07-20: bounded "cliff" mitigation -- see _place_blocks'
+    # hard_deadline docstring. Fixed, known-in-advance ceiling (never
+    # estimated/adaptive) -- only ever matters when phase1_deadline is hit
+    # with a small tail of blocks left, in which case those last few get up
+    # to this much extra time instead of being dumped into _force_place.
+    # Deliberately a modest +10 percentage points (not more) given repair
+    # still needs real room afterward, and TLE is the single worst possible
+    # outcome (-1, same as a crash) -- this is the more conservative side of
+    # what was considered.
+    phase1_hard_deadline = t_start + timelimit * 0.6
 
     if priority_rule == "regret":
         print(f"[Greedy] {'-' * 56}")
@@ -763,20 +1022,47 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                 key=lambda i: (blocks_data[i]["due_date"], blocks_data[i]["processing_time"])
             )
             rule_label = "EDD"
+        sorted_indices = _perturb_construction_order(sorted_indices, seed)
         print(f"[Greedy] {'-' * 56}")
-        print(f"[Greedy] Phase 1 : {rule_label} greedy placement ...")
-        assignments = _place_blocks(
-            sorted_indices, blocks_data, bays,
-            bay_placed, bay_schedule, bay_loads,
-            w1, w2, w3, forced_ids=set(),
-            t_start=t_start, log_interval=max(1, n_blocks // 10),
-            deadline=phase1_deadline,
-        )
+        if construction_mode == "batched":
+            print(f"[Greedy] Phase 1 : {rule_label} batched joint placement "
+                  f"(batch={PHASE1_BATCH_SIZE}) ...")
+            assignments = _place_blocks_batched(
+                sorted_indices, blocks_data, bays,
+                bay_placed, bay_schedule, bay_loads,
+                w1, w2, w3,
+                t_start=t_start, log_interval=max(1, n_blocks // 10),
+                deadline=phase1_deadline,
+            )
+        else:
+            print(f"[Greedy] Phase 1 : {rule_label} greedy placement ...")
+            assignments = _place_blocks(
+                sorted_indices, blocks_data, bays,
+                bay_placed, bay_schedule, bay_loads,
+                w1, w2, w3, forced_ids=set(),
+                t_start=t_start, log_interval=max(1, n_blocks // 10),
+                deadline=phase1_deadline,
+                hard_deadline=phase1_hard_deadline,
+            )
 
     elapsed_p1 = time.time() - t_start
     loads_str = "  ".join(f"bay{i}={round(bay_loads[i])}" for i in range(n_bays))
     print(f"[Greedy] Phase 1 done  |  placed={len(assignments)}  {loads_str}  "
           f"elapsed={elapsed_p1:.2f}s")
+
+    # 2026-07-20: a timelimit-dependent max_per_block (smaller candidate
+    # count below some short-timelimit threshold) was tried here and then
+    # reverted before ever being tested -- see notes/algorithm_overview.md
+    # item 19/20. The short-timelimit path is already validated by a real
+    # eval-server result (2nd submission improved 4/6 known problems), and
+    # the one directly relevant precedent for this exact lever (shrinking
+    # max_per_block in _place_blocks_batched's experiment, same day) made
+    # results WORSE, not better -- not enough evidence to touch already-
+    # working short-timelimit behaviour. Left as a flat max_per_block=20
+    # unconditionally; the open, unexplored, higher-upside direction is the
+    # opposite end (do batched/bigger-MIP approaches help once timelimit is
+    # large, e.g. 600s+?), not shrinking things further at the short end.
+    xpress_max_per_block = 20
 
     # -- Phase 2: repair infeasible assignments --------------------------------
     print(f"[Greedy] {'-' * 56}")
@@ -784,7 +1070,8 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     sol = {"operations": _build_operations(list(assignments.values()))}
     assignments = _repair(prob_info, sol, assignments, bays, blocks_data,
                           w1, w2, w3, t_start, timelimit,
-                          repair_mode=repair_mode, blocking_chain=blocking_chain)
+                          repair_mode=repair_mode, blocking_chain=blocking_chain,
+                          max_per_block=xpress_max_per_block)
 
     # -- Phase 2.5: left-justify (pull blocks earlier where possible) ---------
     if left_justify:
@@ -812,12 +1099,43 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
         else:
             print("[Greedy] Left-justify: skipped (pre-sweep state not feasible)")
 
+    # -- Phase 2.6: right-justify then re-left-justify (escape local optima) --
+    # 2026-07-20: alternating RCPSP justification directions -- see
+    # _right_justify's docstring for why this is only safe to keep when
+    # followed by a mandatory left-justify pass and verified as a whole.
+    if right_justify:
+        print(f"[Greedy] {'-' * 56}")
+        print("[Greedy] Phase 2.6 : right-justify + re-left-justify ...")
+        from utils import check_feasibility as _cf_rj
+        pre_rj_sol = {"operations": _build_operations(list(assignments.values()))}
+        pre_rj_result = _cf_rj(prob_info, pre_rj_sol)
+        if pre_rj_result["feasible"]:
+            rj_deadline = t_start + timelimit * 0.87
+            right_justified, n_moved_r = _right_justify(assignments, bays, blocks_data, deadline=rj_deadline)
+            re_left_justified, n_moved_l = _left_justify(right_justified, bays, blocks_data, deadline=rj_deadline)
+            rj_sol = {"operations": _build_operations(list(re_left_justified.values()))}
+            rj_result = _cf_rj(prob_info, rj_sol)
+            if rj_result["feasible"] and rj_result["objective"] <= pre_rj_result["objective"] + 1e-6:
+                gain = pre_rj_result["objective"] - rj_result["objective"]
+                assignments = re_left_justified
+                print(f"[Greedy] Right-justify+re-left: moved {n_moved_r}+{n_moved_l} block(s)  "
+                      f"obj {pre_rj_result['objective']:.0f} -> {rj_result['objective']:.0f} "
+                      f"(-{gain:.0f})")
+            else:
+                print(f"[Greedy] Right-justify+re-left: swept result not better/feasible "
+                      f"(feasible={rj_result['feasible']}), keeping pre-sweep state "
+                      f"({n_moved_r}+{n_moved_l} candidate move(s) discarded)")
+        else:
+            print("[Greedy] Right-justify+re-left: skipped (pre-sweep state not feasible)")
+
     # -- Phase 3: improve feasible-but-tardy assignments with leftover time ---
     print(f"[Greedy] {'-' * 56}")
     print("[Greedy] Phase 3 : improve (worst-tardiness LNS) ...")
     assignments = _improve(prob_info, assignments, bays, blocks_data,
                            w1, w2, w3, t_start, timelimit, atc_k=atc_k,
-                           annealing=annealing, z2z3_modes=z2z3_modes, seed=seed)
+                           annealing=annealing, z2z3_modes=z2z3_modes, seed=seed,
+                           max_per_block=xpress_max_per_block,
+                           z1_lower_bound=z1_lower_bound, z23_relax=z23_relax)
 
     elapsed_total = time.time() - t_start
     final_sol = {"operations": _build_operations(list(assignments.values()))}
@@ -935,6 +1253,8 @@ def _place_blocks(
     t_start: float | None = None,
     log_interval: int = 0,
     deadline: float | None = None,
+    hard_deadline: float | None = None,
+    near_done_frac: float = 0.05,
 ) -> dict[int, dict]:
     """
     Shared placement kernel used by both Phase 1 and _repair (greedy mode).
@@ -983,6 +1303,31 @@ def _place_blocks(
                        own 90%/98% time guards) ever runs, risking a hard
                        time-limit-exceeded failure with nothing to show for it.
                        None (default) disables the check.
+    hard_deadline    : optional, absolute time.time() ceiling for the Phase-1
+                       "cliff" mitigation (2026-07-20). None (default) means
+                       "no extension" -- deadline is always the real cutoff,
+                       identical to before this parameter existed. When set,
+                       and `deadline` has just been passed with only a small
+                       tail of block_ids left (<= near_done_frac of the
+                       total), the search is allowed to keep running for
+                       those last few blocks up to hard_deadline instead of
+                       immediately force-placing them -- observed on prob_40/
+                       prob_20 (dense/congested instances): hitting deadline
+                       with a handful of blocks left was dumping all of them
+                       into _force_place (which ignores due dates entirely),
+                       producing a large, avoidable Z1 spike, when in most
+                       cases the real search only needed a little more time
+                       to finish them properly. hard_deadline is always a
+                       fixed, separately-computed absolute ceiling (never
+                       estimated/adaptive), so the worst-case extra time used
+                       is bounded and known in advance regardless of how this
+                       plays out -- once past hard_deadline too, blocks fall
+                       back to forced placement exactly as they would have
+                       without this parameter at all. If MANY blocks still
+                       remain when deadline is hit, this changes nothing.
+    near_done_frac   : fraction of len(block_ids) below which the tail is
+                       considered "nearly done" and eligible for the
+                       hard_deadline extension above. Default 0.05 (5%).
 
     Returns
     -------
@@ -997,6 +1342,7 @@ def _place_blocks(
     _bay_areas   = [bay.width * bay.height for bay in bays]
     _avg_area    = sum(_bay_areas) / n_bays
     bay_weights  = [_avg_area / a for a in _bay_areas]
+    _extension_logged = False
 
     for rank, bi in enumerate(block_ids):
         blk_data = blocks_data[bi]
@@ -1010,7 +1356,24 @@ def _place_blocks(
 
         best_score     = float("inf")
         best_placement = None
-        past_deadline  = deadline is not None and time.time() > deadline
+
+        # See hard_deadline's docstring above -- bounded, opt-in extension
+        # for the "nearly done" tail only; a no-op whenever hard_deadline is
+        # None (default), or when many blocks are still left, or once
+        # hard_deadline itself has also passed.
+        effective_deadline = deadline
+        if (deadline is not None and hard_deadline is not None
+                and time.time() > deadline):
+            remaining = len(block_ids) - rank
+            if (remaining <= max(1, int(len(block_ids) * near_done_frac))
+                    and time.time() < hard_deadline):
+                effective_deadline = hard_deadline
+                if not _extension_logged:
+                    _extension_logged = True
+                    print(f"[Greedy]   deadline extension: {remaining}/{len(block_ids)} "
+                          f"block(s) left, allowing up to hard_deadline instead of forcing")
+
+        past_deadline  = effective_deadline is not None and time.time() > effective_deadline
         used_forced    = bi in forced_ids or past_deadline
 
         if not used_forced:
@@ -1025,7 +1388,7 @@ def _place_blocks(
                     entry, exit_t = _find_earliest_slot(
                         prev_blk, bays[pb_id],
                         bay_placed[pb_id], bay_schedule[pb_id],
-                        r_time, proc, deadline=deadline,
+                        r_time, proc, deadline=effective_deadline,
                     )
                     if entry is not None:
                         tardiness = max(0.0, exit_t - due)
@@ -1076,7 +1439,7 @@ def _place_blocks(
                         bay.width, bay.height, active_in_bay, blk_bb
                     )
                     for cx, cy in candidates:
-                        if deadline is not None and time.time() > deadline:
+                        if effective_deadline is not None and time.time() > effective_deadline:
                             deadline_hit = True
                             break
 
@@ -1087,7 +1450,7 @@ def _place_blocks(
 
                         entry, exit_t = _find_earliest_slot(
                             new_blk, bay, placed_in_bay, schedule_in_bay,
-                            r_time, proc, deadline=deadline,
+                            r_time, proc, deadline=effective_deadline,
                         )
                         if entry is None:
                             continue
@@ -1142,6 +1505,134 @@ def _place_blocks(
 
 
 # -----------------------------------------------------------------------------
+# Batched (quasi-Parallel-SGS) construction kernel -- Phase 1 alternative
+# -----------------------------------------------------------------------------
+
+PHASE1_BATCH_SIZE = 4
+PHASE1_MAX_PER_BLOCK = 8
+# Smaller than Phase 3's JOINT_MAX_K=12 / max_per_block=20 -- Phase 1 has to
+# get through n_blocks/BATCH_SIZE batches total (dozens, for n=200-300), so
+# each batch's MIP needs a much tighter per-batch cost than a one-off Phase
+# 3 round. 2026-07-20: measured with batch=6/max_per_block=20, batched Phase
+# 1 ran 2-3x slower per block than plain _place_blocks and left 16-70% of
+# blocks (worse for larger instances) force-placed once phase1_deadline hit
+# -- a clear regression (see notes/algorithm_overview.md). Shrinking both
+# knobs to cut per-batch candidate-generation and pairwise-conflict cost
+# (O(batch_size^2 * max_per_block^2)) is the first thing to try before
+# giving up on batched construction entirely.
+
+
+def _place_blocks_batched(
+    block_ids: list[int],
+    blocks_data: list[dict],
+    bays: list[Bay],
+    bay_placed: list[list[Block]],
+    bay_schedule: list[list[tuple[int, int]]],
+    bay_loads: list[float],
+    w1: float, w2: float, w3: float,
+    t_start: float | None = None,
+    log_interval: int = 0,
+    deadline: float | None = None,
+    batch_size: int = PHASE1_BATCH_SIZE,
+) -> dict[int, dict]:
+    """
+    Quasi-Parallel-SGS alternative to _place_blocks: instead of committing
+    one block at a time (Serial SGS -- see _place_blocks' docstring), chunks
+    block_ids (already priority-sorted by the caller, e.g. EDD order) into
+    batches of `batch_size` and commits each batch *jointly* via
+    xpress_reinsert.reinsert() -- the same joint MIP Phase 3 already uses to
+    reinsert K removed blocks at once, reused here as-is since it makes no
+    assumption that remove_ids were ever previously placed (it only reads
+    the *other*, already-committed blocks via bay_placed/bay_schedule/
+    bay_loads to generate each id's candidates -- see _top_candidates_for_block).
+
+    Motivation: Serial SGS commits each block seeing only *past* decisions,
+    never future ones -- a block committed early can (and empirically does,
+    see notes/algorithm_overview.md #12) end up obstructing a block that
+    hasn't been placed yet, which is exactly what Phase 2 (_repair) exists
+    to clean up after the fact. Jointly deciding a *batch* of blocks at once
+    doesn't eliminate this (batches still commit in order, and a batch has
+    no visibility into blocks in later batches), but it meaningfully
+    shrinks the blast radius: conflicts *within* a batch are resolved
+    before anything is committed, instead of being discovered by Phase 2
+    afterward.
+
+    Falls back to the existing, fully-validated _place_blocks (one at a
+    time, same as Serial SGS) for any batch where the joint MIP is
+    unavailable, times out, or finds no feasible combination -- this is a
+    routine, expected outcome, not an error; it never blocks progress.
+    Batches of size 1 (the last partial chunk) skip the MIP entirely since
+    there is nothing to jointly optimize against a single block.
+    """
+    n_total = len(block_ids)
+    n_bays = len(bays)
+    result: dict[int, dict] = {}
+    n_batches_done = 0
+    n_joint_ok = 0
+
+    for start in range(0, n_total, batch_size):
+        batch_ids = block_ids[start:start + batch_size]
+        n_batches_done += 1
+
+        past_deadline = deadline is not None and time.time() > deadline
+        partial = None
+        used_xpress = False
+
+        if not past_deadline and len(batch_ids) > 1:
+            try:
+                import xpress_reinsert
+                partial = xpress_reinsert.reinsert(
+                    batch_ids, blocks_data, bays,
+                    bay_placed, bay_schedule, bay_loads,
+                    w1, w2, w3, deadline,
+                    max_per_block=PHASE1_MAX_PER_BLOCK,
+                    solve_time_limit=2,
+                )
+            except Exception:
+                partial = None
+            used_xpress = partial is not None
+
+        if used_xpress:
+            n_joint_ok += 1
+            for bi in batch_ids:
+                a = partial[bi]
+                blk_data = blocks_data[bi]
+                final_blk = Block(block_id=bi, block_data=blk_data,
+                                  x=a["x"], y=a["y"], orient_idx=a["orient_idx"])
+                bay_placed[a["bay_id"]].append(final_blk)
+                bay_schedule[a["bay_id"]].append((a["entry_time"], a["exit_time"]))
+                bay_loads[a["bay_id"]] += blk_data["workload"]
+        else:
+            # Deadline already passed, batch of 1, Xpress unavailable, or no
+            # feasible joint combination -- fall back to the proven
+            # one-at-a-time path for just this batch. _place_blocks mutates
+            # bay_placed/bay_schedule/bay_loads in place itself, and forces
+            # every block automatically once `deadline` has passed.
+            partial = _place_blocks(
+                batch_ids, blocks_data, bays,
+                bay_placed, bay_schedule, bay_loads,
+                w1, w2, w3, forced_ids=set(),
+                t_start=t_start, deadline=deadline,
+            )
+
+        result.update(partial)
+
+        if log_interval > 0 and t_start is not None:
+            n_done = start + len(batch_ids)
+            if n_batches_done % max(1, log_interval // batch_size) == 0 or n_done == n_total:
+                elapsed = time.time() - t_start
+                loads_str = " ".join(f"b{i}={round(bay_loads[i])}" for i in range(n_bays))
+                tag = "xpress-joint" if used_xpress else "greedy-fallback"
+                print(f"[Greedy]   {n_done:4d}/{n_total}"
+                      f"  batch#{n_batches_done} (size={len(batch_ids)}) via={tag}"
+                      f"  loads=[{loads_str}]"
+                      f"  joint_ok={n_joint_ok}/{n_batches_done}"
+                      f"  {elapsed:.1f}s")
+
+    return result
+
+
+# -----------------------------------------------------------------------------
 # Shared helper: rebuild per-bay state from a flat assignments dict
 # -----------------------------------------------------------------------------
 
@@ -1176,6 +1667,89 @@ def _rebuild_bay_state(
 # Phase 3: improve feasible-but-tardy assignments using leftover time budget
 # -----------------------------------------------------------------------------
 
+def _try_rebalance_move(
+    remove_ids: list[int],
+    target_bay_id: int,
+    blocks_data: list[dict],
+    bays: list[Bay],
+    bay_placed: list[list[Block]],
+    bay_schedule: list[list[tuple[int, int]]],
+    deadline: float | None,
+) -> dict[int, dict] | None:
+    """
+    2026-07-20: dedicated move for the "balance" operator, targeting Z2
+    directly instead of relying on the general reinsertion search to
+    happen to prefer a lighter bay.
+
+    Z2 = max over bay PAIRS of |weighted load difference| -- unlike Z1/Z3
+    (sums over blocks, so any local improvement to any block helps), Z2
+    only moves when a change touches the specific pair currently realising
+    that max. The general per-block _placement_score search blends bay
+    load with tardiness/preference, so a block removed from the heaviest
+    bay often lands back in a bay that's merely "less bad" by the combined
+    score, not the specific lightest bay that would actually close the
+    current bottleneck gap. This function forces the direct move: try to
+    place every block in remove_ids into target_bay_id (the caller passes
+    the currently lightest-*weighted*-load bay) specifically, one at a time
+    in workload-descending order, using the exact same
+    _candidate_positions / _find_earliest_slot search _place_blocks already
+    uses elsewhere -- just restricted to one bay -- so this adds no new
+    geometry/feasibility logic, only a new *target*.
+
+    Returns None if any block has no feasible slot in target_bay_id (routine
+    -- the target bay may simply be too full; caller must fall back to the
+    general multi-bay reinsertion search in that case, exactly like
+    xpress_reinsert.reinsert()'s None contract). Does not mutate
+    bay_placed/bay_schedule -- the caller commits on accept, same as every
+    other reinsertion path in this module.
+    """
+    bay = bays[target_bay_id]
+    local_placed = list(bay_placed[target_bay_id])
+    local_schedule = list(bay_schedule[target_bay_id])
+    result: dict[int, dict] = {}
+
+    order = sorted(remove_ids, key=lambda b: -blocks_data[b]["workload"])
+    for bi in order:
+        if deadline is not None and time.time() > deadline:
+            return None
+        blk_data = blocks_data[bi]
+        r_time = blk_data["release_time"]
+        due = blk_data["due_date"]
+        proc = blk_data["processing_time"]
+
+        best = None
+        for oi in range(len(blk_data["shape"])):
+            blk_bb = _block_bbox(blk_data, oi)
+            lx0, ly0, lx1, ly1 = blk_bb
+            if (math.ceil(-lx0) > math.floor(bay.width - lx1) or
+                    math.ceil(-ly0) > math.floor(bay.height - ly1)):
+                continue
+            for cx, cy in _candidate_positions(bay.width, bay.height, local_placed, blk_bb):
+                new_blk = Block(block_id=bi, block_data=blk_data, x=cx, y=cy, orient_idx=oi)
+                if not bay.contains_block(new_blk):
+                    continue
+                entry, exit_t = _find_earliest_slot(
+                    new_blk, bay, local_placed, local_schedule, r_time, proc, deadline=deadline,
+                )
+                if entry is None:
+                    continue
+                tardiness = max(0.0, exit_t - due)
+                if best is None or tardiness < best[0]:
+                    best = (tardiness, cx, cy, oi, entry, exit_t)
+
+        if best is None:
+            return None  # target bay has no feasible slot for this block
+        _, cx, cy, oi, entry, exit_t = best
+        local_placed.append(Block(block_id=bi, block_data=blk_data, x=cx, y=cy, orient_idx=oi))
+        local_schedule.append((entry, exit_t))
+        result[bi] = {
+            "block_id": bi, "bay_id": target_bay_id,
+            "x": int(round(cx)), "y": int(round(cy)), "orient_idx": oi,
+            "entry_time": int(round(entry)), "exit_time": int(round(exit_t)),
+        }
+    return result
+
+
 def _select_removal_candidates(
     best_assignments: dict[int, dict],
     blocks_data: list[dict],
@@ -1206,12 +1780,55 @@ def _select_removal_candidates(
                     repeatedly. A pure-random destroy operator gives the
                     search a genuinely different, unbiased neighborhood each
                     time -- classic ALNS diversification.
+    "swap"       -- targeted PAIR: the worst-tardiness block plus whichever
+                    same-bay block currently occupies that block's own
+                    IDEAL (unconstrained) window [release_time,
+                    release_time+processing_time). Drives Z1, but via a
+                    fundamentally different mechanism than "tardy": "tardy"
+                    removes blocks independently and lets the general search
+                    re-place them one at a time (or jointly, for the same K
+                    blocks Xpress happens to be given) -- it has no notion
+                    of WHY a block is tardy. Two blocks that are mutually
+                    blocking each other's best spot are exactly the case
+                    plain independent removal handles worst: removing just
+                    the tardy one and re-searching often just finds the same
+                    (or an equally bad) spot again, since the actual blocker
+                    is still sitting exactly where it was. Explicitly pairing
+                    the tardy block with its concrete blocker and handing
+                    both to the SAME joint reinsertion (see _improve's
+                    Xpress-joint-attempt condition, now keyed off
+                    len(remove_ids) rather than the nominal k so a 2-block
+                    swap pair always gets the joint treatment regardless of
+                    which k_values slot this round landed on) lets the
+                    solver actually consider swapping their positions, not
+                    just independently re-searching each in isolation.
+                    Added 2026-07-20.
 
     Added 2026-07-20 so Phase 3 can target Z2/Z3 too, not just Z1 -- before
     this, blocks that were fully feasible but sitting in a suboptimal
     bay for balance/preference reasons (rather than being late) were never
     reconsidered by anything in this codebase.
     """
+    if mode == "swap":
+        tardy_scored = [
+            (bid, a["exit_time"] - blocks_data[bid]["due_date"])
+            for bid, a in best_assignments.items()
+            if a["exit_time"] - blocks_data[bid]["due_date"] > 0
+        ]
+        if not tardy_scored:
+            return []
+        tardy_scored.sort(key=lambda t: -t[1])
+        for bid, _ in tardy_scored[:max(1, k)]:
+            a = best_assignments[bid]
+            ideal_start = blocks_data[bid]["release_time"]
+            ideal_end = ideal_start + blocks_data[bid]["processing_time"]
+            for other_bid, other_a in best_assignments.items():
+                if other_bid == bid or other_a["bay_id"] != a["bay_id"]:
+                    continue
+                if _time_overlaps(ideal_start, ideal_end, other_a["entry_time"], other_a["exit_time"]):
+                    return [bid, other_bid]
+        return []  # none of the worst-tardiness blocks has an identifiable same-bay blocker
+
     if mode == "random":
         all_ids = list(best_assignments.keys())
         if not all_ids:
@@ -1253,6 +1870,22 @@ def _select_removal_candidates(
         scored.sort(key=lambda t: -t[1])
         return [bid for bid, _ in scored[:k]]
 
+    if mode == "wholebay":
+        # Whole-bay joint reinsertion (added 2026-07-21): unlike every other
+        # mode here, this ignores k entirely and returns ALL blocks
+        # currently in the heaviest-weighted bay, so _improve can hand the
+        # whole set to xpress_reinsert.reinsert() as one joint MIP -- see
+        # analysis/bay_mip_probe.py, which validated that bay-independence
+        # makes this tractable (K=170 in ~4s) once candidate generation is
+        # restricted to that one bay via restrict_bay_id.
+        loads = {}
+        for bid, a in best_assignments.items():
+            loads[a["bay_id"]] = loads.get(a["bay_id"], 0.0) + blocks_data[bid]["workload"]
+        if not loads:
+            return []
+        heaviest = max(loads, key=lambda j: bay_weights[j] * loads[j])
+        return [bid for bid, a in best_assignments.items() if a["bay_id"] == heaviest]
+
     return []
 
 
@@ -1270,7 +1903,10 @@ def _improve(prob_info: dict,
             initial_temp_frac: float = 0.01,
             cooling_rate: float = 0.98,
             seed: int | None = None,
-            z2z3_modes: bool = True) -> dict[int, dict]:
+            z2z3_modes: bool = True,
+            max_per_block: int = 20,
+            z1_lower_bound: float = 0.0,
+            z23_relax: bool = True) -> dict[int, dict]:
     """
     Large-neighborhood-search-style improvement pass for an already FEASIBLE
     solution, targeting all three objective components (not just Z1).
@@ -1375,6 +2011,7 @@ def _improve(prob_info: dict,
     current_obj = base_result["objective"]
     best_assignments = dict(assignments)
     best_obj = current_obj
+    best_obj1 = base_result["obj1"]
     t0 = initial_temp_frac * max(1.0, current_obj)
 
     p_avg = sum(b["processing_time"] for b in blocks_data) / max(1, len(blocks_data))
@@ -1411,12 +2048,81 @@ def _improve(prob_info: dict,
     # version of the same idea: operators that keep paying off get picked
     # more often, operators that stop paying off fade out (but never to
     # exactly zero, so they can still recover if the landscape changes).
-    operator_names = ("tardy", "preference", "balance", "random") if z2z3_modes else ("tardy",)
+    # 2026-07-21: "wholebay" is included in BOTH branches (unlike
+    # preference/balance, which are Z2/Z3-only and gated behind
+    # z2z3_modes) because its validated benefit (analysis/bay_mip_probe.py)
+    # was entirely a Z1 improvement -- a joint re-optimization of a whole
+    # bay's schedule can resolve tardiness conflicts a K<=12 round can't
+    # even see. It's deliberately left OUT of the Z1_URGENCY_BOOST/pruning
+    # treatment below (unlike tardy/swap): each attempt costs a full
+    # whole-bay MIP solve (seconds, not the near-instant cost of a small
+    # K round), so over-boosting its roulette-wheel odds while Z1 has
+    # headroom risks spending disproportionate time on it; its natural EMA
+    # weight already lets it earn more rounds if it keeps paying off.
+    operator_names = (["tardy", "swap", "wholebay", "preference", "balance", "random"]
+                      if z2z3_modes else ["tardy", "swap", "wholebay"])
     op_weight: dict[str, float] = {name: 1.0 for name in operator_names}
+    Z1_URGENCY_BOOST = 3.0  # see the round-selection weights computation below
+
+    # 2026-07-20: Z1's theoretical lower bound (see analysis/lower_bound.py --
+    # sum of each block's own release_time+processing_time-due_date floor,
+    # ignoring all spatial/crane constraints) is a proof, not a heuristic --
+    # if best_obj1 has already reached it, no possible move can ever reduce
+    # Z1 further, so 'tardy' and 'swap' (which both exist purely to reduce
+    # Z1) are mathematically guaranteed useless from here on. Drop them
+    # outright (not just down-weight them) so every remaining round goes to
+    # an operator that can still possibly help, instead of occasionally
+    # wasting a full remove+reinsert+feasibility-check cycle on an operator
+    # that provably cannot improve anything. ('swap' would also naturally
+    # self-deactivate on its own -- its candidate search returns [] once
+    # there's no tardy block left to pair up -- but pruning it here too
+    # avoids even that wasted round-trip.)
+    for _z1_op in ("tardy", "swap"):
+        if best_obj1 <= z1_lower_bound + 1e-6 and _z1_op in operator_names:
+            operator_names.remove(_z1_op)
+            op_weight.pop(_z1_op, None)
+            print(f"[Greedy] Improve: Z1={best_obj1:.0f} already at its theoretical lower bound "
+                  f"({z1_lower_bound:.0f}) -- dropping '{_z1_op}' operator (provably futile from here)")
     WEIGHT_DECAY = 0.8       # fraction of old weight kept each update
     REWARD_NEW_BEST = 3.0
     REWARD_ACCEPTED = 0.5    # accepted (e.g. an annealing walk) but not a new best
     REWARD_REJECTED = 0.0
+
+    # 2026-07-20: preference/balance-mode trials measured a 15.8%/32.8%
+    # acceptance rate across today's logs (vs 62.9%/57.0% for tardy/random)
+    # -- these operators exist specifically to target Z3/Z2, but under the
+    # plain "never accept worse" rule almost every attempt is thrown away
+    # even when it genuinely improves its own target, because *any* increase
+    # in Z1 tends to be enough to lose given w1's typical dominance (see
+    # notes/algorithm_overview.md). Give these two operators (only) a small,
+    # bounded epsilon-constraint-style relaxation: accept a trial that makes
+    # the WALK state (current_obj) worse by up to Z23_RELAX_FRAC, so the
+    # search can actually explore the Z1-vs-Z2/Z3 trade-off instead of
+    # rejecting it outright every time. Z23_MAX_DRIFT_FRAC caps how far the
+    # walk can compound away from the best-known solution across repeated
+    # small acceptances. Neither constant is validated yet (see changelog);
+    # `best_obj`/`best_assignments` -- what actually gets returned -- are
+    # completely unaffected by this and can never regress, exactly like the
+    # existing annealing=True walk/best split this reuses the pattern from.
+    Z23_RELAX_FRAC = 0.01
+    Z23_MAX_DRIFT_FRAC = 0.05
+    # 2026-07-20: found via repeated-run testing (prob_40/prob_20, 3 runs
+    # each at 180s, current code vs the deterministic 2nd-submission
+    # baseline) that this relaxation can hurt on instances where Phase 1
+    # construction itself is expensive (dense/congested bays -> heavy
+    # _find_earliest_slot cost), leaving very little of the time budget for
+    # Phase 3. Mechanism: unlike strict hill-climbing (a rejected trial
+    # leaves current_assignments unchanged, so the next round always retries
+    # from the best-known state), an epsilon-relaxed accept MOVES
+    # current_assignments to a worse state -- if very few rounds remain,
+    # there may not be enough left to find a genuine improvement and climb
+    # back out before time runs out, effectively wasting one of only a
+    # handful of rounds. Strict hill-climbing never has this failure mode
+    # (every round is retried from best). Guard: only allow the relaxation
+    # when there's still a reasonable amount of wall-clock room left for
+    # Phase 3 to recover in -- below this, fall back to strict acceptance
+    # for preference/balance too (same as tardy/random already do).
+    Z23_MIN_REMAINING_FOR_RELAX = 15.0
 
     # Joint Xpress reinsertion is O(K^2 x max_per_block^2) in the pairwise
     # conflict check -- fine for the small K's, prohibitively expensive for
@@ -1434,7 +2140,20 @@ def _improve(prob_info: dict,
                 break
 
             remaining_ops = [n for n in operator_names if n not in tried_this_round]
-            weights = [op_weight[n] for n in remaining_ops]
+            # 2026-07-20: w1 typically dominates w2/w3 (see notes/
+            # algorithm_overview.md), and Z1's lower bound is 0 on every
+            # local instance checked so far -- so while Z1 hasn't reached
+            # it, a 'tardy' success is usually worth far more to the
+            # combined objective than a same-sized preference/balance win.
+            # Boost tardy's roulette-wheel selection odds (not its
+            # underlying EMA weight -- that still reflects its own track
+            # record) while there's still Z1 headroom; once best_obj1 hits
+            # z1_lower_bound, 'tardy' is removed from operator_names
+            # entirely (see above), so this boost naturally becomes moot.
+            weights = [
+                op_weight[n] * (Z1_URGENCY_BOOST if n in ("tardy", "swap") and best_obj1 > z1_lower_bound + 1e-6 else 1.0)
+                for n in remaining_ops
+            ]
             mode = rng.choices(remaining_ops, weights=weights, k=1)[0]
             tried_this_round.add(mode)
 
@@ -1453,29 +2172,96 @@ def _improve(prob_info: dict,
             bay_placed, bay_schedule, bay_loads = _rebuild_bay_state(
                 trial_assignments, bays, blocks_data
             )
-            # Try an exact joint reinsertion of the K removed blocks via Xpress
-            # first (see xpress_reinsert.py) -- it can find combinations plain
-            # greedy can't (deciding all K at once instead of one at a time).
-            # reinsert() returns None on any failure (Xpress unavailable, no
-            # candidates, solve timeout/infeasible, or K too large -- see
-            # JOINT_MAX_K), which is a routine, expected outcome here, not an
-            # error -- always fall back to the same greedy _place_blocks
-            # search used everywhere else in this codebase. k=1 has nothing
-            # to jointly optimize against (no pairwise conflicts possible
-            # with a single block), so skip the MIP overhead entirely.
+
+            # "balance" targets Z2 (a max/bottleneck over bay pairs, not a
+            # per-block sum -- see _try_rebalance_move's docstring), so
+            # before falling into the general reinsertion search (which
+            # optimizes the blended _placement_score and often does NOT
+            # land removed blocks in the specific bay that would close the
+            # current bottleneck), force-try placing every removed block
+            # directly into the currently lightest-weighted-load bay.
+            # Returns None (routine, not an error) if that bay has no room
+            # -- falls through to the same xpress/greedy chain every other
+            # mode uses.
             partial = None
-            if 1 < k <= JOINT_MAX_K:
+            used_direct = False
+            used_wholebay = False
+            if mode == "wholebay":
+                # 2026-07-20: jointly re-optimize an ENTIRE bay's current
+                # block set (K can be 100+, far past JOINT_MAX_K) instead of
+                # a small scored removal -- see analysis/bay_mip_probe.py
+                # for the full rationale/validation (K=170 completed in
+                # ~4s and found a real ~505k objective improvement once
+                # candidate generation was restricted to the target bay).
+                # Integrated as an ALNS operator (an earlier standalone
+                # "Phase 4" that ran this only in Phase 3's leftover time
+                # was removed -- it shared Phase 3's own deadline, so Phase
+                # 3 essentially never stalled before it, and Phase 4 never
+                # fired in testing) so the already-proven weighted operator
+                # selection decides how often it's worth trying, instead of
+                # carving out a hardcoded chunk of budget away from the
+                # other operators that have already shown strong results.
+                # restrict_bay_id + current_positions (both passed to
+                # reinsert() only here) are what make this tractable at
+                # all: without them, candidate generation alone couldn't
+                # even finish for K~100 within any reasonable budget.
+                target_bay_id = current_assignments[remove_ids[0]]["bay_id"]
+                current_positions = {
+                    bid: (current_assignments[bid]["bay_id"], current_assignments[bid]["x"],
+                         current_assignments[bid]["y"], current_assignments[bid]["orient_idx"],
+                         current_assignments[bid]["entry_time"], current_assignments[bid]["exit_time"])
+                    for bid in remove_ids
+                }
                 try:
                     import xpress_reinsert
                     partial = xpress_reinsert.reinsert(
                         remove_ids, blocks_data, bays,
                         bay_placed, bay_schedule, bay_loads,
                         w1, w2, w3, deadline,
+                        max_per_block=WHOLE_BAY_MAX_PER_BLOCK,
+                        restrict_bay_id=target_bay_id,
+                        current_positions=current_positions,
+                    )
+                except Exception:
+                    partial = None
+                used_wholebay = partial is not None
+            elif mode == "balance":
+                target_bay_id = min(range(len(bays)), key=lambda j: bay_weights[j] * bay_loads[j])
+                partial = _try_rebalance_move(
+                    remove_ids, target_bay_id, blocks_data, bays,
+                    bay_placed, bay_schedule, deadline,
+                )
+                used_direct = partial is not None
+
+            # Try an exact joint reinsertion of the removed blocks via Xpress
+            # next (see xpress_reinsert.py) -- it can find combinations plain
+            # greedy can't (deciding all of them at once instead of one at a
+            # time). reinsert() returns None on any failure (Xpress
+            # unavailable, no candidates, solve timeout/infeasible, or too
+            # large -- see JOINT_MAX_K), which is a routine, expected outcome
+            # here, not an error -- always fall back to the same greedy
+            # _place_blocks search used everywhere else in this codebase. A
+            # single removed block has nothing to jointly optimize against
+            # (no pairwise conflicts possible), so skip the MIP overhead
+            # entirely. 2026-07-20: keyed off len(remove_ids) rather than the
+            # nominal k_values slot k -- modes like "swap" always return
+            # exactly 2 ids regardless of which k this round landed on, and
+            # a swap pair specifically NEEDS the joint solve (that's the
+            # whole point -- see _select_removal_candidates' "swap" docstring)
+            # to actually be considered together instead of independently.
+            if partial is None and 1 < len(remove_ids) <= JOINT_MAX_K:
+                try:
+                    import xpress_reinsert
+                    partial = xpress_reinsert.reinsert(
+                        remove_ids, blocks_data, bays,
+                        bay_placed, bay_schedule, bay_loads,
+                        w1, w2, w3, deadline,
+                        max_per_block=max_per_block,
                     )
                 except Exception:
                     partial = None
 
-            used_xpress = partial is not None
+            used_xpress = partial is not None and not used_direct and not used_wholebay
             if partial is None:
                 order = sorted(remove_ids, key=lambda b: -_atc_priority(blocks_data[b], p_avg, atc_k))
                 partial = _place_blocks(
@@ -1489,7 +2275,9 @@ def _improve(prob_info: dict,
 
             trial_result = check_feasibility(prob_info, _build(trial_assignments))
             round_idx += 1
-            solver_tag = "xpress" if used_xpress else "greedy"
+            solver_tag = ("direct-rebalance" if used_direct
+                         else "wholebay-xpress" if used_wholebay
+                         else "xpress" if used_xpress else "greedy")
 
             if not trial_result["feasible"]:
                 op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_REJECTED
@@ -1501,6 +2289,20 @@ def _improve(prob_info: dict,
             if annealing:
                 temperature = t0 * (cooling_rate ** round_idx)
                 accept = delta < 0 or (temperature > 1e-9 and rng.random() < math.exp(-delta / temperature))
+            elif (z23_relax and mode in ("preference", "balance") and delta > 0
+                  and (deadline - time.time()) >= Z23_MIN_REMAINING_FOR_RELAX):
+                # epsilon-constraint-style relaxation for these two operators
+                # only -- see Z23_RELAX_FRAC's docstring above. temperature
+                # here isn't an SA temperature; it's logged as the absolute
+                # slack budget so the reason a worse trial got accepted is
+                # visible in the log line below. Gated on remaining time
+                # (Z23_MIN_REMAINING_FOR_RELAX) -- see that constant's
+                # docstring: too little time left to recover from a worse
+                # walk step, so fall through to strict acceptance instead.
+                temperature = Z23_RELAX_FRAC * max(1.0, current_obj)
+                within_step_budget = delta <= temperature
+                within_drift_cap = (current_obj + delta) <= best_obj * (1 + Z23_MAX_DRIFT_FRAC)
+                accept = within_step_budget and within_drift_cap
             else:
                 temperature = 0.0
                 accept = delta < -1e-6
@@ -1520,13 +2322,28 @@ def _improve(prob_info: dict,
                 prev_best = best_obj
                 best_assignments = current_assignments
                 best_obj = current_obj
+                best_obj1 = trial_result["obj1"]
                 stalled = 0
                 op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_NEW_BEST
                 elapsed = time.time() - t_start
+                # 2026-07-20 bugfix: this print (which reads op_weight[mode])
+                # must run BEFORE the tardy-pruning block below -- if mode ==
+                # "tardy" and this round is the one that reaches
+                # z1_lower_bound, the pruning block pop()s op_weight["tardy"],
+                # and reading op_weight[mode] afterward raised KeyError('tardy')
+                # (found via repeated-run sanity testing, reproduced with full
+                # traceback). Order matters: read/print first, prune second.
                 print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} removed={remove_ids} "
                       f"via={solver_tag}  NEW BEST obj {prev_best:.0f} -> {best_obj:.0f} "
                       f"(gain={gain:.0f})  "
                       f"w={op_weight[mode]:.2f}  elapsed={elapsed:.1f}s")
+                for _z1_op in ("tardy", "swap"):
+                    if best_obj1 <= z1_lower_bound + 1e-6 and _z1_op in operator_names:
+                        operator_names.remove(_z1_op)
+                        op_weight.pop(_z1_op, None)
+                        print(f"[Greedy] Improve: Z1={best_obj1:.0f} reached its theoretical lower "
+                              f"bound ({z1_lower_bound:.0f}) -- dropping '{_z1_op}' operator "
+                              f"(provably futile from here)")
             else:
                 op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_ACCEPTED
                 print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} via={solver_tag}  "
@@ -1630,6 +2447,97 @@ def _left_justify(
     return trial, n_moved
 
 
+def _right_justify(
+    assignments: dict[int, dict],
+    bays: list[Bay],
+    blocks_data: list[dict],
+    deadline: float | None,
+) -> tuple[dict[int, dict], int]:
+    """
+    Push blocks as LATE as each bay's own current right edge allows --
+    classical RCPSP "right justification" (Valls et al.), the mirror of
+    _left_justify.
+
+    Motivation (2026-07-20): alternating left- and right-justification
+    passes is a standard RCPSP technique for escaping local optima that a
+    single directional compaction can't -- a schedule that's already left-
+    justified can still have blocks positioned in a way that, after being
+    deliberately pushed toward the LATE end of the bay's current span,
+    opens up DIFFERENT gaps that a subsequent left-justify pass can exploit
+    better than the first left-justify pass did (see notes/
+    algorithm_overview.md's Left Justification entry -- this is the
+    "alternate with Right if beneficial" follow-up planned there, now
+    justified since Left has repeatedly shown real gains in today's logs).
+
+    Unlike _left_justify (which only ever accepts a move that's individually
+    earlier than the block's current position -- a strict, always-safe
+    improvement), this pass is INTENTIONALLY not individually-improving: it
+    can push a block's own exit_time later than it currently is (increasing
+    that block's own tardiness), as long as it doesn't exceed the bay's
+    current overall right edge (the max exit_time already present in that
+    bay when the sweep for that bay starts). This is deliberate -- the point
+    is to explore a differently-shaped configuration, not to greedily
+    improve on this pass alone. The caller MUST treat this as a scratch
+    exploration step: run this, then _left_justify on the result, then
+    check_feasibility + compare the combined before/after objective ONCE,
+    keeping the two-pass result only if it's feasible and at least as good
+    as the state before right-justify started (exactly like every other
+    "trial then verify-or-discard" pattern in this module). Right-justify on
+    its own, without a mandatory following left-justify + whole-result
+    verification, is not safe to keep.
+
+    For each block, bay-by-bay and LATEST-current-entry first (mirroring
+    left-justify's earliest-first order -- so a later block's own move can
+    free room for the next-latest one within the same sweep), keeps its
+    bay/position/orientation fixed and asks _find_latest_slot for the latest
+    feasible slot not exceeding that bay's snapshot right edge.
+
+    Never mutates the input assignments. Returns (new_assignments, n_moved).
+    """
+    trial = dict(assignments)
+    n_moved = 0
+
+    for bay_id, bay in enumerate(bays):
+        bay_block_ids_snapshot = [bid for bid, a in trial.items() if a["bay_id"] == bay_id]
+        if not bay_block_ids_snapshot:
+            continue
+        bay_right_edge = max(trial[bid]["exit_time"] for bid in bay_block_ids_snapshot)
+        bay_block_ids = sorted(bay_block_ids_snapshot, key=lambda bid: trial[bid]["entry_time"], reverse=True)
+
+        for bid in bay_block_ids:
+            if deadline is not None and time.time() > deadline:
+                return trial, n_moved
+
+            a = trial[bid]
+            blk_data = blocks_data[bid]
+            r_time = blk_data["release_time"]
+            proc = blk_data["processing_time"]
+
+            others = [o for o in bay_block_ids if o != bid]
+            placed_others = [
+                Block(block_id=o, block_data=blocks_data[o],
+                     x=int(trial[o]["x"]), y=int(trial[o]["y"]),
+                     orient_idx=trial[o]["orient_idx"])
+                for o in others
+            ]
+            schedule_others = [(trial[o]["entry_time"], trial[o]["exit_time"]) for o in others]
+
+            this_blk = Block(block_id=bid, block_data=blk_data,
+                             x=int(a["x"]), y=int(a["y"]), orient_idx=a["orient_idx"])
+            new_entry, new_exit = _find_latest_slot(
+                this_blk, bay, placed_others, schedule_others, r_time, proc,
+                latest_exit_bound=bay_right_edge, deadline=deadline,
+            )
+            if new_entry is not None and new_entry > a["entry_time"]:
+                trial[bid] = dict(a, entry_time=int(new_entry), exit_time=int(new_exit))
+                n_moved += 1
+
+    return trial, n_moved
+
+
+WHOLE_BAY_MAX_PER_BLOCK = 40
+
+
 # -----------------------------------------------------------------------------
 # Phase 2: repair infeasible blocks
 # -----------------------------------------------------------------------------
@@ -1644,7 +2552,8 @@ def _repair(prob_info: dict,
             timelimit: float,
             max_passes: int = 10,
             repair_mode: str = "greedy",
-            blocking_chain: bool = True) -> dict[int, dict]:
+            blocking_chain: bool = True,
+            max_per_block: int = 20) -> dict[int, dict]:
     """
     Iteratively detect infeasible blocks and repair them.
 
@@ -1885,6 +2794,7 @@ def _repair(prob_info: dict,
                         to_repair, blocks_data, bays,
                         bay_placed, bay_schedule2, bay_loads,
                         w1, w2, w3, t_start + timelimit * 0.80,
+                        max_per_block=max_per_block,
                     )
                 except Exception as _dbg_exc:
                     import traceback
