@@ -98,6 +98,34 @@ def _time_overlaps(a_entry: int, a_exit: int,
 
 
 # -----------------------------------------------------------------------------
+# ATC (Apparent Tardiness Cost) priority -- adapted for Phase-1 static ordering
+# -----------------------------------------------------------------------------
+
+def _atc_priority(blk_data: dict, p_avg: float, k: float) -> float:
+    """
+    Adapted Apparent Tardiness Cost index (Vepsalainen & Morton 1987).
+
+    Classic ATC recomputes I_j(t) = (w_j/p_j) * exp(-max(d_j-p_j-t,0)/(k*p_avg))
+    dynamically at every dispatch decision, using the shared machine's current
+    free time as t. Phase 1 here is a single static sort feeding sequential
+    greedy insertion (not a re-evaluated dispatch loop), so t is approximated
+    once per block by its own release_time -- the earliest moment it could
+    possibly be considered, which is this problem's natural analogue of "not
+    yet on the machine's clock".
+
+    w_j (per-job importance) has no analogue here -- Z1 sums tardiness
+    unweighted across blocks -- so w_j=1 for every block, reducing the rule to
+    a slack-modulated SPT (shortest processing time) index. Higher index =
+    higher priority = placed earlier in Phase 1's insertion order. k is the
+    lookahead parameter: large k approaches pure SPT (1/p_j), small k
+    approaches "least slack first" (near-EDD-like urgency).
+    """
+    p = max(1.0, float(blk_data["processing_time"]))
+    slack = max(0.0, blk_data["due_date"] - blk_data["release_time"] - blk_data["processing_time"])
+    return (1.0 / p) * math.exp(-slack / max(1e-9, k * p_avg))
+
+
+# -----------------------------------------------------------------------------
 # Helper: candidate position generation (bottom-left corner based)
 # -----------------------------------------------------------------------------
 
@@ -177,13 +205,25 @@ def _find_earliest_slot(new_blk: Block,
                         placed_in_bay: list[Block],
                         schedule_in_bay: list[tuple[int, int]],
                         r_time: int,
-                        proc: int) -> tuple[int | None, int | None]:
+                        proc: int,
+                        deadline: float | None = None) -> tuple[int | None, int | None]:
     """
     Return the earliest (entry, exit_t) time slot >= r_time at which new_blk
     can be crane-placed into bay without violating Stage-2 (entry) or Stage-3
     (exit) feasibility.  Returns (None, None) if no candidate entry passes
     both checks -- this means the (position, bay) combination is infeasible for
     any time and the caller should try a different position.
+
+    deadline : optional absolute time.time() budget.  candidate_entries is
+      bounded by len(schedule_in_bay) (every already-placed block's exit
+      time), which can be large in a densely-scheduled bay; each candidate
+      does several check_entry/check_exit/check_collisions calls, so a
+      single call to this function can itself take a non-trivial slice of
+      wall time on a big instance. Checked once per candidate_entries
+      iteration so a slow bay can't make one caller-level deadline check
+      (in _place_blocks) miss its budget by an unbounded amount. Once past
+      deadline, returns (None, None) immediately -- same as "no slot found"
+      -- rather than silently returning a stale/partial answer.
 
     -- Candidate enumeration ----------------------------------------------------
     Candidates = {r_time} | {exit_time of every already-placed block in bay}.
@@ -211,6 +251,9 @@ def _find_earliest_slot(new_blk: Block,
     candidate_entries = sorted({r_time} | {e for _, e in schedule_in_bay if e > r_time})
 
     for entry_candidate in candidate_entries:
+        if deadline is not None and time.time() > deadline:
+            return None, None
+
         entry  = max(r_time, entry_candidate)
         exit_t = entry + proc
 
@@ -301,30 +344,61 @@ def _empty_bay_entry(schedule_in_bay: list[tuple[int, int]],
 # -----------------------------------------------------------------------------
 
 def greedyalgorithm(prob_info: dict, timelimit: float,
-                    repair_mode: str = "greedy") -> dict:
+                    repair_mode: str = "greedy",
+                    priority_rule: str = "edd",
+                    atc_k: float = 2.0) -> dict:
     """
-    EDD + Best-Fit Greedy algorithm with post-hoc feasibility repair.
+    ATC/EDD + Best-Fit Greedy algorithm with post-hoc feasibility repair and
+    an anytime tardiness-improvement pass.
 
     Parameters
     ----------
-    prob_info   : instance JSON dict with keys "name", "bays", "blocks", "weights"
-    timelimit   : wall-clock time limit in seconds
-    repair_mode : "greedy" (default) or "simple" -- see module docstring for details
+    prob_info     : instance JSON dict with keys "name", "bays", "blocks", "weights"
+    timelimit     : wall-clock time limit in seconds
+    repair_mode   : "greedy" (default) or "simple" -- see module docstring for details
+    priority_rule : "edd" (default), "slack" (min-slack-first / MST), or "atc"
+                    -- Phase-1 insertion order. See _atc_priority for the ATC
+                    adaptation used here.
+
+                    Empirically (analysis/priority_rule_compare.py, all 40
+                    train instances, 15s/instance): plain EDD won on 21/40
+                    instances (avg objective 484M) vs slack 11/40 (505M) vs
+                    ATC 8/40 (522M) -- i.e. the simplest rule beat both more
+                    "principled" alternatives here, likely because
+                    _placement_score already folds w1*tardiness into every
+                    candidate's score at commit time, so insertion order
+                    matters less than the ATC/MST theory (developed for
+                    single-machine scheduling, not this multi-bay spatial
+                    setting) would suggest. "atc"/"slack" are kept available
+                    for further experimentation, not because either beat EDD.
+    atc_k         : ATC lookahead parameter (only used when priority_rule="atc").
+                    Larger = closer to pure SPT, smaller = closer to min-slack-first.
 
     Returns
     -------
     solution dict in the format described in the module docstring
 
-    Phase 1 -- EDD greedy placement:
-        Blocks sorted by (due_date, processing_time).  For each block, every
-        (bay, orientation, candidate position) is tried; _find_earliest_slot
-        computes the earliest crane-feasible time slot.  The combination
-        minimising _placement_score is committed.  bay_placed, bay_schedule,
-        and bay_loads are updated incrementally.
+    Phase 1 -- greedy placement:
+        Blocks sorted by priority_rule (ATC index descending, or (due_date,
+        processing_time) for EDD).  For each block, every (bay, orientation,
+        candidate position) is tried; _find_earliest_slot computes the
+        earliest crane-feasible time slot.  The combination minimising
+        _placement_score is committed.  bay_placed, bay_schedule, and
+        bay_loads are updated incrementally.
 
     Phase 2 -- Repair (see _repair and module docstring for details):
         Calls _repair which runs up to max_passes rounds of
-        check_feasibility -> re-place violating blocks.
+        check_feasibility -> re-place violating blocks, worst-tardiness-first.
+
+    Phase 3 -- Improve (see _improve): once Phase 2 reaches a feasible
+        solution, spends any leftover time budget trying to reduce Z1 by
+        removing and re-inserting the currently most-tardy blocks. _repair
+        only ever touches blocks that are spatially/crane infeasible; a
+        block can be fully feasible and still sit at a large, avoidable
+        tardiness with nothing in Phases 1-2 ever revisiting it. Phase 3
+        exists specifically to use whatever time Phases 1-2 didn't need
+        (which, empirically, is often several seconds on mid-sized train
+        instances) on exactly that gap.
     """
     t_start = time.time()
 
@@ -384,22 +458,52 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
         )
 
     # -- Phase 1: aggressive greedy --------------------------------------------
-    sorted_indices = sorted(
-        range(n_blocks),
-        key=lambda i: (blocks_data[i]["due_date"], blocks_data[i]["processing_time"])
-    )
+    def _slack(i: int) -> float:
+        b = blocks_data[i]
+        return max(0.0, b["due_date"] - b["release_time"] - b["processing_time"])
+
+    if priority_rule == "atc":
+        p_avg = sum(b["processing_time"] for b in blocks_data) / max(1, n_blocks)
+        sorted_indices = sorted(
+            range(n_blocks),
+            key=lambda i: (-_atc_priority(blocks_data[i], p_avg, atc_k), blocks_data[i]["due_date"])
+        )
+        rule_label = f"ATC(k={atc_k})"
+    elif priority_rule == "slack":
+        sorted_indices = sorted(
+            range(n_blocks),
+            key=lambda i: (_slack(i), blocks_data[i]["due_date"])
+        )
+        rule_label = "MST(min-slack)"
+    else:
+        sorted_indices = sorted(
+            range(n_blocks),
+            key=lambda i: (blocks_data[i]["due_date"], blocks_data[i]["processing_time"])
+        )
+        rule_label = "EDD"
     print(f"[Greedy] {'-' * 56}")
-    print("[Greedy] Phase 1 : EDD greedy placement ...")
+    print(f"[Greedy] Phase 1 : {rule_label} greedy placement ...")
 
     bay_placed:   list[list[Block]]             = [[] for _ in range(n_bays)]
     bay_schedule: list[list[tuple[int, int]]]   = [[] for _ in range(n_bays)]
     bay_loads:    list[float]                   = [0.0] * n_bays
 
+    # Phase 1 gets at most 50% of the total timelimit for full search. This
+    # was originally 75%, but Phase 1's per-block search has no "good enough,
+    # stop" early exit -- it always explores every candidate for the best
+    # score -- so in practice it happily consumes its *entire* allotment on
+    # every instance, not just large/hard ones. With Phase 3 now existing to
+    # spend leftover time on tardiness specifically, Phase 1 no longer needs
+    # (or should get) the lion's share of the budget: a decent-not-perfect
+    # Phase 1 construction plus more Phase 3 rounds empirically beats a
+    # maximally-searched Phase 1 with almost no Phase 3 left.
+    phase1_deadline = t_start + timelimit * 0.5
     assignments = _place_blocks(
         sorted_indices, blocks_data, bays,
         bay_placed, bay_schedule, bay_loads,
         w1, w2, w3, forced_ids=set(),
         t_start=t_start, log_interval=max(1, n_blocks // 10),
+        deadline=phase1_deadline,
     )
 
     elapsed_p1 = time.time() - t_start
@@ -414,6 +518,12 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     assignments = _repair(prob_info, sol, assignments, bays, blocks_data,
                           w1, w2, w3, t_start, timelimit,
                           repair_mode=repair_mode)
+
+    # -- Phase 3: improve feasible-but-tardy assignments with leftover time ---
+    print(f"[Greedy] {'-' * 56}")
+    print("[Greedy] Phase 3 : improve (worst-tardiness LNS) ...")
+    assignments = _improve(prob_info, assignments, bays, blocks_data,
+                           w1, w2, w3, t_start, timelimit, atc_k=atc_k)
 
     elapsed_total = time.time() - t_start
     final_sol = {"operations": _build_operations(list(assignments.values()))}
@@ -530,6 +640,7 @@ def _place_blocks(
     prev_assignments: dict[int, dict] | None = None,
     t_start: float | None = None,
     log_interval: int = 0,
+    deadline: float | None = None,
 ) -> dict[int, dict]:
     """
     Shared placement kernel used by both Phase 1 and _repair (greedy mode).
@@ -567,6 +678,17 @@ def _place_blocks(
     prev_assignments : previous assignment dict (repair mode fast-path)
     t_start          : wall-clock start time (for log timestamps)
     log_interval     : print a progress line every N blocks (0 = silent)
+    deadline         : absolute time.time() budget for the full O(bays x
+                       orientations x positions) search in step 2.  Once
+                       exceeded, every remaining block in block_ids is routed
+                       straight to the forced path (step 3), the same
+                       guaranteed-O(bays x orientations) _force_place fallback
+                       used for cycle-breaking.  Without this, a single very
+                       large instance could exhaust the entire timelimit
+                       inside this search before Phase 2 (which does have its
+                       own 90%/98% time guards) ever runs, risking a hard
+                       time-limit-exceeded failure with nothing to show for it.
+                       None (default) disables the check.
 
     Returns
     -------
@@ -594,7 +716,8 @@ def _place_blocks(
 
         best_score     = float("inf")
         best_placement = None
-        used_forced    = bi in forced_ids
+        past_deadline  = deadline is not None and time.time() > deadline
+        used_forced    = bi in forced_ids or past_deadline
 
         if not used_forced:
             # -- Repair fast-path: try previous (bay, x, y, orient) first -----
@@ -608,7 +731,7 @@ def _place_blocks(
                     entry, exit_t = _find_earliest_slot(
                         prev_blk, bays[pb_id],
                         bay_placed[pb_id], bay_schedule[pb_id],
-                        r_time, proc
+                        r_time, proc, deadline=deadline,
                     )
                     if entry is not None:
                         tardiness = max(0.0, exit_t - due)
@@ -621,13 +744,26 @@ def _place_blocks(
                         best_placement = (pb_id, px, py, poi, entry, exit_t)
 
             # -- Full search (Phase-1 style) -----------------------------------
+            # deadline is only checked once per block (above, via past_deadline)
+            # before this search starts. That is not fine-grained enough: a
+            # single block with many candidate positions in a densely-packed
+            # bay can itself take multiple seconds inside this triple loop
+            # (each _find_earliest_slot call walks every already-placed block
+            # in the bay). Re-check deadline periodically inside the candidate
+            # loop too, so one slow block cannot by itself blow past deadline
+            # by more than a handful of candidate evaluations.
+            deadline_hit = False
             bay_order = sorted(range(n_bays), key=lambda j: prefs[j], reverse=True)
             for bay_id in bay_order:
+                if deadline_hit:
+                    break
                 bay             = bays[bay_id]
                 placed_in_bay   = bay_placed[bay_id]
                 schedule_in_bay = bay_schedule[bay_id]
 
                 for oi in range(n_orient):
+                    if deadline_hit:
+                        break
                     blk_bb = _block_bbox(blk_data, oi)
                     lx0_oi, ly0_oi, lx1_oi, ly1_oi = blk_bb
                     # Require a valid integer reference-point position to exist:
@@ -645,7 +781,11 @@ def _place_blocks(
                     candidates = _candidate_positions(
                         bay.width, bay.height, active_in_bay, blk_bb
                     )
-                    for (cx, cy) in candidates:
+                    for cx, cy in candidates:
+                        if deadline is not None and time.time() > deadline:
+                            deadline_hit = True
+                            break
+
                         new_blk = Block(block_id=bi, block_data=blk_data,
                                         x=cx, y=cy, orient_idx=oi)
                         if not bay.contains_block(new_blk):
@@ -653,7 +793,7 @@ def _place_blocks(
 
                         entry, exit_t = _find_earliest_slot(
                             new_blk, bay, placed_in_bay, schedule_in_bay,
-                            r_time, proc
+                            r_time, proc, deadline=deadline,
                         )
                         if entry is None:
                             continue
@@ -705,6 +845,187 @@ def _place_blocks(
                       f"  {elapsed:.1f}s")
 
     return result
+
+
+# -----------------------------------------------------------------------------
+# Shared helper: rebuild per-bay state from a flat assignments dict
+# -----------------------------------------------------------------------------
+
+def _rebuild_bay_state(
+    assignments: dict[int, dict],
+    bays: list[Bay],
+    blocks_data: list[dict],
+) -> tuple[list[list[Block]], list[list[tuple[int, int]]], list[float]]:
+    """
+    Rebuild (bay_placed, bay_schedule, bay_loads) from a flat assignments dict.
+
+    Shared by _repair (greedy mode) and _improve: both remove a subset of
+    blocks from assignments and need an accurate view of what's still
+    occupying each bay before re-searching placements for the removed ones.
+    """
+    n_bays = len(bays)
+    bay_placed:   list[list[Block]]           = [[] for _ in range(n_bays)]
+    bay_schedule: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
+    bay_loads:    list[float]                 = [0.0] * n_bays
+    for a in assignments.values():
+        bid_a  = a["block_id"]
+        bay_id = a["bay_id"]
+        blk = Block(block_id=bid_a, block_data=blocks_data[bid_a],
+                    x=int(a["x"]), y=int(a["y"]), orient_idx=a["orient_idx"])
+        bay_placed[bay_id].append(blk)
+        bay_schedule[bay_id].append((a["entry_time"], a["exit_time"]))
+        bay_loads[bay_id] += blocks_data[bid_a]["workload"]
+    return bay_placed, bay_schedule, bay_loads
+
+
+# -----------------------------------------------------------------------------
+# Phase 3: improve feasible-but-tardy assignments using leftover time budget
+# -----------------------------------------------------------------------------
+
+def _improve(prob_info: dict,
+            assignments: dict[int, dict],
+            bays: list[Bay],
+            blocks_data: list[dict],
+            w1: float, w2: float, w3: float,
+            t_start: float,
+            timelimit: float,
+            atc_k: float = 2.0,
+            k_values: tuple[int, ...] = (1, 2, 3, 5),
+            stall_limit: int | None = None) -> dict[int, dict]:
+    """
+    Large-neighborhood-search-style improvement pass for an already FEASIBLE
+    solution, targeting Z1 (total tardiness).
+
+    _repair only ever touches blocks that are spatially/crane infeasible; a
+    solution can be fully feasible and still have large tardiness sitting on
+    the table with nothing in Phases 1-2 ever revisiting it. This pass
+    targets exactly that gap: each round, remove the current top-K
+    most-tardy blocks, re-insert them via the same _place_blocks search used
+    everywhere else, and keep the result only if the *actual* objective
+    (re-verified with check_feasibility, not assumed from a delta estimate)
+    improved -- otherwise the round is discarded and best_assignments is
+    unchanged.
+
+    Only ever called on a solution that is already feasible; if the incoming
+    solution is not feasible this returns it unchanged, so it can never be
+    blamed for masking a Phase 2 failure. Runs until timelimit*0.99 or no
+    positive-tardiness block remains, so it is safe to let it simply run out
+    the clock -- every accepted round is independently verified, so an
+    interruption at any point still returns a solution at least as good as
+    what Phase 2 produced.
+
+    k_values are cycled round-robin (1, 2, 3, 5, 1, 2, ...): a round that
+    can't find a better placement by moving a single worst block gets a
+    chance with a larger removal set on the next round, which can unblock
+    chains a single relocate cannot, without paying the cost of a large
+    removal every round.
+
+    Parameters
+    ----------
+    stall_limit : stop early after this many consecutive non-improving
+                  rounds (default 3 * len(k_values)). Purely a wall-clock
+                  courtesy for local testing -- returning early vs. running
+                  to the deadline doesn't affect the score either way, since
+                  the leaderboard only sees the final returned solution.
+    """
+    from utils import check_feasibility
+
+    if stall_limit is None:
+        stall_limit = 3 * len(k_values)
+
+    def _build(a: dict[int, dict]) -> dict:
+        return {"operations": _build_operations(list(a.values()))}
+
+    base_result = check_feasibility(prob_info, _build(assignments))
+    if not base_result["feasible"]:
+        print("[Greedy] Improve: skipped (incoming solution is not feasible)")
+        return assignments
+
+    best_assignments = dict(assignments)
+    best_obj = base_result["objective"]
+    p_avg = sum(b["processing_time"] for b in blocks_data) / max(1, len(blocks_data))
+    deadline = t_start + timelimit * 0.99
+
+    round_idx = 0
+    stalled = 0
+    while time.time() < deadline:
+        tardy = sorted(
+            (
+                (bid, a["exit_time"] - blocks_data[bid]["due_date"])
+                for bid, a in best_assignments.items()
+                if a["exit_time"] - blocks_data[bid]["due_date"] > 0
+            ),
+            key=lambda t: -t[1],
+        )
+        if not tardy:
+            print(f"[Greedy] Improve: Z1=0, nothing left to improve  round={round_idx}")
+            break
+
+        k = k_values[round_idx % len(k_values)]
+        remove_ids = [bid for bid, _ in tardy[:k]]
+
+        trial_assignments = dict(best_assignments)
+        for bid in remove_ids:
+            trial_assignments.pop(bid, None)
+
+        bay_placed, bay_schedule, bay_loads = _rebuild_bay_state(
+            trial_assignments, bays, blocks_data
+        )
+        # Try an exact joint reinsertion of the K removed blocks via Xpress
+        # first (see xpress_reinsert.py) -- it can find combinations plain
+        # greedy can't (deciding all K at once instead of one at a time).
+        # reinsert() returns None on any failure (Xpress unavailable, no
+        # candidates, solve timeout/infeasible), which is a routine, expected
+        # outcome here, not an error -- always fall back to the same greedy
+        # _place_blocks search used everywhere else in this codebase.
+        # k=1 has nothing to jointly optimize against (no pairwise conflicts
+        # possible with a single block), so skip the MIP overhead entirely.
+        partial = None
+        if k > 1:
+            try:
+                import xpress_reinsert
+                partial = xpress_reinsert.reinsert(
+                    remove_ids, blocks_data, bays,
+                    bay_placed, bay_schedule, bay_loads,
+                    w1, w2, w3, deadline,
+                )
+            except Exception:
+                partial = None
+
+        used_xpress = partial is not None
+        if partial is None:
+            order = sorted(remove_ids, key=lambda b: -_atc_priority(blocks_data[b], p_avg, atc_k))
+            partial = _place_blocks(
+                order, blocks_data, bays,
+                bay_placed, bay_schedule, bay_loads,
+                w1, w2, w3, forced_ids=set(),
+                prev_assignments=best_assignments,
+                deadline=deadline,
+            )
+        trial_assignments.update(partial)
+
+        trial_result = check_feasibility(prob_info, _build(trial_assignments))
+        round_idx += 1
+        if trial_result["feasible"] and trial_result["objective"] < best_obj - 1e-6:
+            gain = best_obj - trial_result["objective"]
+            best_assignments = trial_assignments
+            best_obj = trial_result["objective"]
+            stalled = 0
+            elapsed = time.time() - t_start
+            solver_tag = "xpress" if used_xpress else "greedy"
+            print(f"[Greedy] Improve round {round_idx}: k={k} removed={remove_ids} "
+                  f"via={solver_tag}  obj -{gain:.0f} -> {best_obj:.0f}  elapsed={elapsed:.1f}s")
+        else:
+            stalled += 1
+            solver_tag = "xpress" if used_xpress else "greedy"
+            print(f"[Greedy] Improve round {round_idx}: k={k} via={solver_tag}  "
+                  f"no gain (feasible={trial_result['feasible']})  stalled={stalled}")
+            if stalled >= stall_limit:
+                print(f"[Greedy] Improve: no gain for {stalled} rounds, stopping early  "
+                      f"round={round_idx}")
+                break
+
+    return best_assignments
 
 
 # -----------------------------------------------------------------------------
@@ -776,7 +1097,11 @@ def _repair(prob_info: dict,
     forced_ids:      set[int]       = set()
 
     for pass_idx in range(max_passes):
-        if time.time() - t_start > timelimit * 0.98:
+        # Capped at 80% (not 98%) so Phase 3 (_improve) is structurally
+        # guaranteed a real slice of the budget instead of only getting
+        # whatever repair happens not to use -- repair already exits early
+        # via the feasible-break below whenever it converges sooner anyway.
+        if time.time() - t_start > timelimit * 0.80:
             break
 
         result = check_feasibility(prob_info, sol)
@@ -805,8 +1130,21 @@ def _repair(prob_info: dict,
         if not to_repair:
             break
 
-        # Re-place in EDD order so earlier-due blocks get the best slots first
-        to_repair.sort(key=lambda b: (blocks_data[b]["due_date"],
+        # Re-place worst-current-tardiness-first so the biggest Z1 offenders
+        # claim the best remaining slots. assignments[b] still holds each
+        # block's pre-repair entry/exit at this point (removal happens later,
+        # per branch below), so "current tardiness" is well-defined here.
+        # Blocks that are infeasible but not tardy (e.g. a pure spatial/crane
+        # violation with tardiness=0) fall back to EDD ordering, since
+        # tardiness alone can't distinguish them.
+        def _current_tardiness(b: int) -> float:
+            a = assignments.get(b)
+            if a is None:
+                return 0.0
+            return max(0.0, a["exit_time"] - blocks_data[b]["due_date"])
+
+        to_repair.sort(key=lambda b: (-_current_tardiness(b),
+                                      blocks_data[b]["due_date"],
                                       blocks_data[b]["processing_time"]))
         n_repl = len(to_repair)
 
@@ -871,25 +1209,18 @@ def _repair(prob_info: dict,
             # Reconstruct bay_placed / bay_schedule / bay_loads from the
             # remaining valid assignments.  This gives _place_blocks an accurate
             # view of which positions and time-slots are already occupied.
-            n_bays = len(bays)
-            bay_placed:    list[list[Block]]            = [[] for _ in range(n_bays)]
-            bay_schedule2: list[list[tuple[int, int]]]  = [[] for _ in range(n_bays)]
-            bay_loads:     list[float]                  = [0.0] * n_bays
-
-            for a in assignments.values():
-                bid_a  = a["block_id"]
-                bay_id = a["bay_id"]
-                blk    = Block(block_id=bid_a, block_data=blocks_data[bid_a],
-                               x=int(a["x"]), y=int(a["y"]), orient_idx=a["orient_idx"])
-                bay_placed[bay_id].append(blk)
-                bay_schedule2[bay_id].append((a["entry_time"], a["exit_time"]))
-                bay_loads[bay_id] += blocks_data[bid_a]["workload"]
+            bay_placed, bay_schedule2, bay_loads = _rebuild_bay_state(
+                assignments, bays, blocks_data
+            )
 
             for ri, bi in enumerate(to_repair):
-                # Time guard: switch to forced path when 90% of timelimit is used.
-                # Without this, a slow repair search could exhaust the timelimit
-                # before all blocks are placed, causing Stage-1 (assignment) failures.
-                if time.time() - t_start > timelimit * 0.90:
+                # Time guard: switch to forced path once 75% of timelimit is
+                # used (was 90% -- tightened alongside the 80% pass-loop cap
+                # above so repair reliably hands time back to Phase 3).
+                # Without this, a slow repair search could exhaust the
+                # timelimit before all blocks are placed, causing Stage-1
+                # (assignment) failures.
+                if time.time() - t_start > timelimit * 0.75:
                     forced_ids.add(bi)
                 prev_a  = assignments.get(bi)
                 partial = _place_blocks(
@@ -897,6 +1228,7 @@ def _repair(prob_info: dict,
                     bay_placed, bay_schedule2, bay_loads,
                     w1, w2, w3, forced_ids,
                     prev_assignments=assignments,
+                    deadline=t_start + timelimit * 0.80,
                 )
                 assignments.update(partial)
                 new_a       = partial[bi]
