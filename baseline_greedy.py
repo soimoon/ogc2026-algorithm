@@ -1995,8 +1995,7 @@ def _improve(prob_info: dict,
             if k <= cap
         }))
 
-    if stall_limit is None:
-        stall_limit = 3 * len(k_values)
+    _stall_limit_arg = stall_limit
 
     def _build(a: dict[int, dict]) -> dict:
         return {"operations": _build_operations(list(a.values()))}
@@ -2022,21 +2021,7 @@ def _improve(prob_info: dict,
 
     round_idx = 0
     stalled = 0
-    # 2026-07-20: modes are now tried in escalating order WITHIN a single
-    # round -- "tardy" first always, and "preference"/"balance" only get a
-    # turn if tardy's own trial this round didn't yield an accepted move.
-    # Previously modes were picked by a fixed round_idx%N schedule regardless
-    # of whether tardy was still succeeding, which meant a scheduled
-    # preference/balance round could displace a round that would otherwise
-    # have gone to a *productive* tardy attempt -- pure opportunity cost,
-    # since Phase 3's accept-only-if-better rule can't undo the lost time.
-    # Measured effect: on some instances this made the final objective worse
-    # than z2z3_modes=False despite never accepting a worse solution (see
-    # notes/algorithm_overview.md). Escalating only on failure means every
-    # instance where "tardy" alone would have kept succeeding behaves
-    # identically to z2z3_modes=False (zero divergence, zero opportunity
-    # cost) -- preference/balance only get to spend time that a stalled
-    # tardy attempt would otherwise have spent uselessly anyway.
+    empty_operators_seen: set[str] = set()
     # 2026-07-20: proper ALNS-style adaptive operator selection, replacing
     # the earlier fixed escalation+pruning scheme. Each operator (destroy
     # mode) has a weight; each round, one operator is picked by
@@ -2063,6 +2048,17 @@ def _improve(prob_info: dict,
                       if z2z3_modes else ["tardy", "swap", "wholebay"])
     op_weight: dict[str, float] = {name: 1.0 for name in operator_names}
     Z1_URGENCY_BOOST = 3.0  # see the round-selection weights computation below
+
+    if _stall_limit_arg is None:
+        # 2026-07-21: scaled by len(operator_names) (evaluated once here,
+        # before any Z1-lower-bound pruning shrinks it) to roughly preserve
+        # the old pass-based scheme's effective patience now that each round
+        # is a single weighted-random trial instead of a whole pass through
+        # every operator -- see the round-loop rewrite below for why passes
+        # were removed.
+        stall_limit = 3 * len(k_values) * len(operator_names)
+    else:
+        stall_limit = _stall_limit_arg
 
     # 2026-07-20: Z1's theoretical lower bound (see analysis/lower_bound.py --
     # sum of each block's own release_time+processing_time-due_date floor,
@@ -2131,236 +2127,269 @@ def _improve(prob_info: dict,
     JOINT_MAX_K = 12
 
     while time.time() < deadline:
-        round_accepted = False
-        any_candidates = False
-        tried_this_round: set[str] = set()
+        # 2026-07-21 rewrite: replaced the old "each operator gets exactly
+        # one guaranteed shot per pass, in weighted order" scheme with pure
+        # weighted-random selection WITH replacement every round -- the
+        # classic ALNS roulette wheel. The old scheme's per-pass exclusivity
+        # meant every operator got the SAME number of attempts regardless of
+        # its EMA weight (weight only reordered a pass, never changed how
+        # OFTEN an operator got picked), which defeated the point of
+        # adaptive weighting: once Z1 hits its lower bound (leaving only
+        # preference/balance/random/wholebay active), wholebay -- usually
+        # unproductive on small/already-well-scheduled instances -- was
+        # guaranteed the same attempt count as preference/balance, diluting
+        # the few rounds that actually mattered. Confirmed both locally
+        # (prob_1 regressed vs the 2nd submission after swap/wholebay were
+        # added) and on a real hidden grading instance (P1's actual score
+        # regressed the same way in the 3rd submission) -- see notes/
+        # algorithm_overview.md. Now a hot-streak operator can be redrawn
+        # every single round (rising weight makes that increasingly likely),
+        # while a consistently unproductive one fades toward a near-zero
+        # share instead of keeping a guaranteed fixed slice.
+        # w1 typically dominates w2/w3 (see notes/algorithm_overview.md),
+        # and Z1's lower bound is 0 on every local instance checked so far
+        # -- so while Z1 hasn't reached it, a 'tardy' success is usually
+        # worth far more to the combined objective than a same-sized
+        # preference/balance win. Boost tardy's roulette-wheel selection
+        # odds (not its underlying EMA weight -- that still reflects its
+        # own track record) while there's still Z1 headroom; once
+        # best_obj1 hits z1_lower_bound, 'tardy' is removed from
+        # operator_names entirely (see below), so this boost naturally
+        # becomes moot.
+        weights = [
+            op_weight[n] * (Z1_URGENCY_BOOST if n in ("tardy", "swap") and best_obj1 > z1_lower_bound + 1e-6 else 1.0)
+            for n in operator_names
+        ]
+        mode = rng.choices(operator_names, weights=weights, k=1)[0]
 
-        while len(tried_this_round) < len(operator_names):
-            if time.time() >= deadline:
+        k = k_values[round_idx % len(k_values)]
+        remove_ids = _select_removal_candidates(
+            current_assignments, blocks_data, bay_weights, k, mode, rng
+        )
+        if not remove_ids:
+            # this operator has nothing to offer right now -- 2026-07-21
+            # bugfix: originally a simple counter of consecutive empty draws
+            # regardless of which operator, meant to approximate "every
+            # operator has been checked." With weighted-random selection
+            # WITH replacement, that's unsound -- if one operator's weight
+            # is even moderately higher, it can get redrawn several times in
+            # a row, and if THAT operator alone is temporarily empty (e.g.
+            # "preference" before any block has a preference penalty), the
+            # counter hits its threshold on pure bad luck from one operator
+            # while others with real candidates never even got a turn.
+            # Confirmed: this caused a real regression (prob_1 stopped at
+            # the raw post-repair objective, zero Phase 3 improvement, in a
+            # before/after run where the direct/unaffected path found the
+            # correct -27,450 improvement). Track the actual SET of
+            # operators confirmed empty since the last non-empty draw
+            # instead -- only concludes "truly nothing left" once every
+            # currently-active operator has individually been checked, no
+            # matter how the weighted draws happened to land.
+            empty_operators_seen.add(mode)
+            if len(empty_operators_seen) >= len(operator_names):
+                print(f"[Greedy] Improve: nothing left to improve (Z1/Z2/Z3 all settled)  round={round_idx}")
                 break
+            continue
+        empty_operators_seen.clear()
 
-            remaining_ops = [n for n in operator_names if n not in tried_this_round]
-            # 2026-07-20: w1 typically dominates w2/w3 (see notes/
-            # algorithm_overview.md), and Z1's lower bound is 0 on every
-            # local instance checked so far -- so while Z1 hasn't reached
-            # it, a 'tardy' success is usually worth far more to the
-            # combined objective than a same-sized preference/balance win.
-            # Boost tardy's roulette-wheel selection odds (not its
-            # underlying EMA weight -- that still reflects its own track
-            # record) while there's still Z1 headroom; once best_obj1 hits
-            # z1_lower_bound, 'tardy' is removed from operator_names
-            # entirely (see above), so this boost naturally becomes moot.
-            weights = [
-                op_weight[n] * (Z1_URGENCY_BOOST if n in ("tardy", "swap") and best_obj1 > z1_lower_bound + 1e-6 else 1.0)
-                for n in remaining_ops
-            ]
-            mode = rng.choices(remaining_ops, weights=weights, k=1)[0]
-            tried_this_round.add(mode)
+        trial_assignments = dict(current_assignments)
+        for bid in remove_ids:
+            trial_assignments.pop(bid, None)
 
-            k = k_values[round_idx % len(k_values)]
-            remove_ids = _select_removal_candidates(
-                current_assignments, blocks_data, bay_weights, k, mode, rng
-            )
-            if not remove_ids:
-                continue  # this operator has nothing to offer right now -- try another
-            any_candidates = True
+        bay_placed, bay_schedule, bay_loads = _rebuild_bay_state(
+            trial_assignments, bays, blocks_data
+        )
 
-            trial_assignments = dict(current_assignments)
-            for bid in remove_ids:
-                trial_assignments.pop(bid, None)
-
-            bay_placed, bay_schedule, bay_loads = _rebuild_bay_state(
-                trial_assignments, bays, blocks_data
-            )
-
-            # "balance" targets Z2 (a max/bottleneck over bay pairs, not a
-            # per-block sum -- see _try_rebalance_move's docstring), so
-            # before falling into the general reinsertion search (which
-            # optimizes the blended _placement_score and often does NOT
-            # land removed blocks in the specific bay that would close the
-            # current bottleneck), force-try placing every removed block
-            # directly into the currently lightest-weighted-load bay.
-            # Returns None (routine, not an error) if that bay has no room
-            # -- falls through to the same xpress/greedy chain every other
-            # mode uses.
-            partial = None
-            used_direct = False
-            used_wholebay = False
-            if mode == "wholebay":
-                # 2026-07-20: jointly re-optimize an ENTIRE bay's current
-                # block set (K can be 100+, far past JOINT_MAX_K) instead of
-                # a small scored removal -- see analysis/bay_mip_probe.py
-                # for the full rationale/validation (K=170 completed in
-                # ~4s and found a real ~505k objective improvement once
-                # candidate generation was restricted to the target bay).
-                # Integrated as an ALNS operator (an earlier standalone
-                # "Phase 4" that ran this only in Phase 3's leftover time
-                # was removed -- it shared Phase 3's own deadline, so Phase
-                # 3 essentially never stalled before it, and Phase 4 never
-                # fired in testing) so the already-proven weighted operator
-                # selection decides how often it's worth trying, instead of
-                # carving out a hardcoded chunk of budget away from the
-                # other operators that have already shown strong results.
-                # restrict_bay_id + current_positions (both passed to
-                # reinsert() only here) are what make this tractable at
-                # all: without them, candidate generation alone couldn't
-                # even finish for K~100 within any reasonable budget.
-                target_bay_id = current_assignments[remove_ids[0]]["bay_id"]
-                current_positions = {
-                    bid: (current_assignments[bid]["bay_id"], current_assignments[bid]["x"],
-                         current_assignments[bid]["y"], current_assignments[bid]["orient_idx"],
-                         current_assignments[bid]["entry_time"], current_assignments[bid]["exit_time"])
-                    for bid in remove_ids
-                }
-                try:
-                    import xpress_reinsert
-                    partial = xpress_reinsert.reinsert(
-                        remove_ids, blocks_data, bays,
-                        bay_placed, bay_schedule, bay_loads,
-                        w1, w2, w3, deadline,
-                        max_per_block=WHOLE_BAY_MAX_PER_BLOCK,
-                        restrict_bay_id=target_bay_id,
-                        current_positions=current_positions,
-                    )
-                except Exception:
-                    partial = None
-                used_wholebay = partial is not None
-            elif mode == "balance":
-                target_bay_id = min(range(len(bays)), key=lambda j: bay_weights[j] * bay_loads[j])
-                partial = _try_rebalance_move(
-                    remove_ids, target_bay_id, blocks_data, bays,
-                    bay_placed, bay_schedule, deadline,
-                )
-                used_direct = partial is not None
-
-            # Try an exact joint reinsertion of the removed blocks via Xpress
-            # next (see xpress_reinsert.py) -- it can find combinations plain
-            # greedy can't (deciding all of them at once instead of one at a
-            # time). reinsert() returns None on any failure (Xpress
-            # unavailable, no candidates, solve timeout/infeasible, or too
-            # large -- see JOINT_MAX_K), which is a routine, expected outcome
-            # here, not an error -- always fall back to the same greedy
-            # _place_blocks search used everywhere else in this codebase. A
-            # single removed block has nothing to jointly optimize against
-            # (no pairwise conflicts possible), so skip the MIP overhead
-            # entirely. 2026-07-20: keyed off len(remove_ids) rather than the
-            # nominal k_values slot k -- modes like "swap" always return
-            # exactly 2 ids regardless of which k this round landed on, and
-            # a swap pair specifically NEEDS the joint solve (that's the
-            # whole point -- see _select_removal_candidates' "swap" docstring)
-            # to actually be considered together instead of independently.
-            if partial is None and 1 < len(remove_ids) <= JOINT_MAX_K:
-                try:
-                    import xpress_reinsert
-                    partial = xpress_reinsert.reinsert(
-                        remove_ids, blocks_data, bays,
-                        bay_placed, bay_schedule, bay_loads,
-                        w1, w2, w3, deadline,
-                        max_per_block=max_per_block,
-                    )
-                except Exception:
-                    partial = None
-
-            used_xpress = partial is not None and not used_direct and not used_wholebay
-            if partial is None:
-                order = sorted(remove_ids, key=lambda b: -_atc_priority(blocks_data[b], p_avg, atc_k))
-                partial = _place_blocks(
-                    order, blocks_data, bays,
+        # "balance" targets Z2 (a max/bottleneck over bay pairs, not a
+        # per-block sum -- see _try_rebalance_move's docstring), so
+        # before falling into the general reinsertion search (which
+        # optimizes the blended _placement_score and often does NOT
+        # land removed blocks in the specific bay that would close the
+        # current bottleneck), force-try placing every removed block
+        # directly into the currently lightest-weighted-load bay.
+        # Returns None (routine, not an error) if that bay has no room
+        # -- falls through to the same xpress/greedy chain every other
+        # mode uses.
+        partial = None
+        used_direct = False
+        used_wholebay = False
+        if mode == "wholebay":
+            # 2026-07-20: jointly re-optimize an ENTIRE bay's current
+            # block set (K can be 100+, far past JOINT_MAX_K) instead of
+            # a small scored removal -- see analysis/bay_mip_probe.py
+            # for the full rationale/validation (K=170 completed in
+            # ~4s and found a real ~505k objective improvement once
+            # candidate generation was restricted to the target bay).
+            # Integrated as an ALNS operator (an earlier standalone
+            # "Phase 4" that ran this only in Phase 3's leftover time
+            # was removed -- it shared Phase 3's own deadline, so Phase
+            # 3 essentially never stalled before it, and Phase 4 never
+            # fired in testing) so the already-proven weighted operator
+            # selection decides how often it's worth trying, instead of
+            # carving out a hardcoded chunk of budget away from the
+            # other operators that have already shown strong results.
+            # restrict_bay_id + current_positions (both passed to
+            # reinsert() only here) are what make this tractable at
+            # all: without them, candidate generation alone couldn't
+            # even finish for K~100 within any reasonable budget.
+            target_bay_id = current_assignments[remove_ids[0]]["bay_id"]
+            current_positions = {
+                bid: (current_assignments[bid]["bay_id"], current_assignments[bid]["x"],
+                     current_assignments[bid]["y"], current_assignments[bid]["orient_idx"],
+                     current_assignments[bid]["entry_time"], current_assignments[bid]["exit_time"])
+                for bid in remove_ids
+            }
+            try:
+                import xpress_reinsert
+                partial = xpress_reinsert.reinsert(
+                    remove_ids, blocks_data, bays,
                     bay_placed, bay_schedule, bay_loads,
-                    w1, w2, w3, forced_ids=set(),
-                    prev_assignments=current_assignments,
-                    deadline=deadline,
+                    w1, w2, w3, deadline,
+                    max_per_block=WHOLE_BAY_MAX_PER_BLOCK,
+                    restrict_bay_id=target_bay_id,
+                    current_positions=current_positions,
                 )
-            trial_assignments.update(partial)
+            except Exception:
+                partial = None
+            used_wholebay = partial is not None
+        elif mode == "balance":
+            target_bay_id = min(range(len(bays)), key=lambda j: bay_weights[j] * bay_loads[j])
+            partial = _try_rebalance_move(
+                remove_ids, target_bay_id, blocks_data, bays,
+                bay_placed, bay_schedule, deadline,
+            )
+            used_direct = partial is not None
 
-            trial_result = check_feasibility(prob_info, _build(trial_assignments))
-            round_idx += 1
-            solver_tag = ("direct-rebalance" if used_direct
-                         else "wholebay-xpress" if used_wholebay
-                         else "xpress" if used_xpress else "greedy")
+        # Try an exact joint reinsertion of the removed blocks via Xpress
+        # next (see xpress_reinsert.py) -- it can find combinations plain
+        # greedy can't (deciding all of them at once instead of one at a
+        # time). reinsert() returns None on any failure (Xpress
+        # unavailable, no candidates, solve timeout/infeasible, or too
+        # large -- see JOINT_MAX_K), which is a routine, expected outcome
+        # here, not an error -- always fall back to the same greedy
+        # _place_blocks search used everywhere else in this codebase. A
+        # single removed block has nothing to jointly optimize against
+        # (no pairwise conflicts possible), so skip the MIP overhead
+        # entirely. 2026-07-20: keyed off len(remove_ids) rather than the
+        # nominal k_values slot k -- modes like "swap" always return
+        # exactly 2 ids regardless of which k this round landed on, and
+        # a swap pair specifically NEEDS the joint solve (that's the
+        # whole point -- see _select_removal_candidates' "swap" docstring)
+        # to actually be considered together instead of independently.
+        if partial is None and 1 < len(remove_ids) <= JOINT_MAX_K:
+            try:
+                import xpress_reinsert
+                partial = xpress_reinsert.reinsert(
+                    remove_ids, blocks_data, bays,
+                    bay_placed, bay_schedule, bay_loads,
+                    w1, w2, w3, deadline,
+                    max_per_block=max_per_block,
+                )
+            except Exception:
+                partial = None
 
-            if not trial_result["feasible"]:
-                op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_REJECTED
-                print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} via={solver_tag}  "
-                      f"infeasible, rejected  w={op_weight[mode]:.2f}")
-                continue
+        used_xpress = partial is not None and not used_direct and not used_wholebay
+        if partial is None:
+            order = sorted(remove_ids, key=lambda b: -_atc_priority(blocks_data[b], p_avg, atc_k))
+            partial = _place_blocks(
+                order, blocks_data, bays,
+                bay_placed, bay_schedule, bay_loads,
+                w1, w2, w3, forced_ids=set(),
+                prev_assignments=current_assignments,
+                deadline=deadline,
+            )
+        trial_assignments.update(partial)
 
-            delta = trial_result["objective"] - current_obj
-            if annealing:
-                temperature = t0 * (cooling_rate ** round_idx)
-                accept = delta < 0 or (temperature > 1e-9 and rng.random() < math.exp(-delta / temperature))
-            elif (z23_relax and mode in ("preference", "balance") and delta > 0
-                  and (deadline - time.time()) >= Z23_MIN_REMAINING_FOR_RELAX):
-                # epsilon-constraint-style relaxation for these two operators
-                # only -- see Z23_RELAX_FRAC's docstring above. temperature
-                # here isn't an SA temperature; it's logged as the absolute
-                # slack budget so the reason a worse trial got accepted is
-                # visible in the log line below. Gated on remaining time
-                # (Z23_MIN_REMAINING_FOR_RELAX) -- see that constant's
-                # docstring: too little time left to recover from a worse
-                # walk step, so fall through to strict acceptance instead.
-                temperature = Z23_RELAX_FRAC * max(1.0, current_obj)
-                within_step_budget = delta <= temperature
-                within_drift_cap = (current_obj + delta) <= best_obj * (1 + Z23_MAX_DRIFT_FRAC)
-                accept = within_step_budget and within_drift_cap
-            else:
-                temperature = 0.0
-                accept = delta < -1e-6
+        trial_result = check_feasibility(prob_info, _build(trial_assignments))
+        round_idx += 1
+        solver_tag = ("direct-rebalance" if used_direct
+                     else "wholebay-xpress" if used_wholebay
+                     else "xpress" if used_xpress else "greedy")
 
-            if not accept:
-                op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_REJECTED
-                print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} via={solver_tag}  "
-                      f"rejected obj={trial_result['objective']:.0f} (T={temperature:.3g})  "
-                      f"w={op_weight[mode]:.2f}")
-                continue
-
-            current_assignments = trial_assignments
-            current_obj = trial_result["objective"]
-            round_accepted = True
-            if current_obj < best_obj - 1e-6:
-                gain = best_obj - current_obj
-                prev_best = best_obj
-                best_assignments = current_assignments
-                best_obj = current_obj
-                best_obj1 = trial_result["obj1"]
-                stalled = 0
-                op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_NEW_BEST
-                elapsed = time.time() - t_start
-                # 2026-07-20 bugfix: this print (which reads op_weight[mode])
-                # must run BEFORE the tardy-pruning block below -- if mode ==
-                # "tardy" and this round is the one that reaches
-                # z1_lower_bound, the pruning block pop()s op_weight["tardy"],
-                # and reading op_weight[mode] afterward raised KeyError('tardy')
-                # (found via repeated-run sanity testing, reproduced with full
-                # traceback). Order matters: read/print first, prune second.
-                print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} removed={remove_ids} "
-                      f"via={solver_tag}  NEW BEST obj {prev_best:.0f} -> {best_obj:.0f} "
-                      f"(gain={gain:.0f})  "
-                      f"w={op_weight[mode]:.2f}  elapsed={elapsed:.1f}s")
-                for _z1_op in ("tardy", "swap"):
-                    if best_obj1 <= z1_lower_bound + 1e-6 and _z1_op in operator_names:
-                        operator_names.remove(_z1_op)
-                        op_weight.pop(_z1_op, None)
-                        print(f"[Greedy] Improve: Z1={best_obj1:.0f} reached its theoretical lower "
-                              f"bound ({z1_lower_bound:.0f}) -- dropping '{_z1_op}' operator "
-                              f"(provably futile from here)")
-            else:
-                op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_ACCEPTED
-                print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} via={solver_tag}  "
-                      f"walked to worse obj={current_obj:.0f} (T={temperature:.3g})  "
-                      f"w={op_weight[mode]:.2f}  best still {best_obj:.0f}")
-            break  # this round succeeded -- don't also try the remaining operators
-
-        if not any_candidates:
-            print(f"[Greedy] Improve: nothing left to improve (Z1/Z2/Z3 all settled)  round={round_idx}")
-            break
-
-        if not round_accepted:
+        if not trial_result["feasible"]:
+            op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_REJECTED
+            print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} via={solver_tag}  "
+                  f"infeasible, rejected  w={op_weight[mode]:.2f}")
             stalled += 1
             if stalled >= stall_limit:
                 print(f"[Greedy] Improve: no new best for {stalled} rounds, stopping early  "
                       f"round={round_idx}")
                 break
+            continue
+
+        delta = trial_result["objective"] - current_obj
+        if annealing:
+            temperature = t0 * (cooling_rate ** round_idx)
+            accept = delta < 0 or (temperature > 1e-9 and rng.random() < math.exp(-delta / temperature))
+        elif (z23_relax and mode in ("preference", "balance") and delta > 0
+              and (deadline - time.time()) >= Z23_MIN_REMAINING_FOR_RELAX):
+            # epsilon-constraint-style relaxation for these two operators
+            # only -- see Z23_RELAX_FRAC's docstring above. temperature
+            # here isn't an SA temperature; it's logged as the absolute
+            # slack budget so the reason a worse trial got accepted is
+            # visible in the log line below. Gated on remaining time
+            # (Z23_MIN_REMAINING_FOR_RELAX) -- see that constant's
+            # docstring: too little time left to recover from a worse
+            # walk step, so fall through to strict acceptance instead.
+            temperature = Z23_RELAX_FRAC * max(1.0, current_obj)
+            within_step_budget = delta <= temperature
+            within_drift_cap = (current_obj + delta) <= best_obj * (1 + Z23_MAX_DRIFT_FRAC)
+            accept = within_step_budget and within_drift_cap
+        else:
+            temperature = 0.0
+            accept = delta < -1e-6
+
+        if not accept:
+            op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_REJECTED
+            print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} via={solver_tag}  "
+                  f"rejected obj={trial_result['objective']:.0f} (T={temperature:.3g})  "
+                  f"w={op_weight[mode]:.2f}")
+            stalled += 1
+            if stalled >= stall_limit:
+                print(f"[Greedy] Improve: no new best for {stalled} rounds, stopping early  "
+                      f"round={round_idx}")
+                break
+            continue
+
+        current_assignments = trial_assignments
+        current_obj = trial_result["objective"]
+        if current_obj < best_obj - 1e-6:
+            gain = best_obj - current_obj
+            prev_best = best_obj
+            best_assignments = current_assignments
+            best_obj = current_obj
+            best_obj1 = trial_result["obj1"]
+            stalled = 0
+            op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_NEW_BEST
+            elapsed = time.time() - t_start
+            # 2026-07-20 bugfix: this print (which reads op_weight[mode])
+            # must run BEFORE the tardy-pruning block below -- if mode ==
+            # "tardy" and this round is the one that reaches
+            # z1_lower_bound, the pruning block pop()s op_weight["tardy"],
+            # and reading op_weight[mode] afterward raised KeyError('tardy')
+            # (found via repeated-run sanity testing, reproduced with full
+            # traceback). Order matters: read/print first, prune second.
+            print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} removed={remove_ids} "
+                  f"via={solver_tag}  NEW BEST obj {prev_best:.0f} -> {best_obj:.0f} "
+                  f"(gain={gain:.0f})  "
+                  f"w={op_weight[mode]:.2f}  elapsed={elapsed:.1f}s")
+            for _z1_op in ("tardy", "swap"):
+                if best_obj1 <= z1_lower_bound + 1e-6 and _z1_op in operator_names:
+                    operator_names.remove(_z1_op)
+                    op_weight.pop(_z1_op, None)
+                    print(f"[Greedy] Improve: Z1={best_obj1:.0f} reached its theoretical lower "
+                          f"bound ({z1_lower_bound:.0f}) -- dropping '{_z1_op}' operator "
+                          f"(provably futile from here)")
+        else:
+            # accepted but not a new best (annealing/epsilon-relax walk step)
+            # -- deliberately does NOT touch `stalled` either way, matching
+            # the pre-2026-07-21 pass-based scheme: only a genuine new best
+            # resets patience, a lateral walk step shouldn't extend it
+            # indefinitely without ever actually improving best_assignments.
+            op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_ACCEPTED
+            print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} via={solver_tag}  "
+                  f"walked to worse obj={current_obj:.0f} (T={temperature:.3g})  "
+                  f"w={op_weight[mode]:.2f}  best still {best_obj:.0f}")
 
     return best_assignments
 
