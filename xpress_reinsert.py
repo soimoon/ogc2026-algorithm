@@ -189,6 +189,7 @@ def reinsert(remove_ids: list[int],
         avg_area = sum(bay_areas) / len(bays)
         bay_weights = [avg_area / a for a in bay_areas]
 
+        _t_cand0 = time.time()
         per_block: dict[int, list[tuple]] = {}
         for bi in remove_ids:
             if deadline is not None and time.time() > deadline:
@@ -215,6 +216,7 @@ def reinsert(remove_ids: list[int],
                       f"(batch={remove_ids})")
                 return None  # this block has no feasible slot at all right now
             per_block[bi] = cands
+        _t_cand1 = time.time()
 
         prob = xp.problem()
         y: dict[tuple[int, int], "xp.var"] = {}
@@ -251,6 +253,8 @@ def reinsert(remove_ids: list[int],
                                                    blk_j, entry_j, exit_j)):
                             prob.addConstraint(y[(bi, ci)] + y[(bj, cj)] <= 1)
 
+        _t_pairs1 = time.time()
+
         objective = xp.Sum(
             per_block[bi][ci][0] * y[(bi, ci)]
             for bi in ids for ci in range(len(per_block[bi]))
@@ -269,8 +273,18 @@ def reinsert(remove_ids: list[int],
         # looks like a solver failure rather than a caller type mismatch).
         prob.controls.maxtime = int(remaining)
         prob.controls.outputlog = 0
+        _t_solve0 = time.time()
         prob.solve()
+        _t_solve1 = time.time()
 
+        # 2026-07-21: timing breakdown -- added to find out whether candidate
+        # generation (all-bays search per block, no restrict_bay_id for this
+        # general call path unlike wholebay's), the O(K^2 x candidates^2)
+        # pairwise conflict construction, or the MIP solve itself dominates
+        # a given call's cost, before deciding where to optimize next.
+        print(f"[xpress_reinsert] TIMING batch_size={len(remove_ids)} "
+              f"candidates={_t_cand1-_t_cand0:.3f}s pairs={_t_pairs1-_t_cand1:.3f}s "
+              f"solve={_t_solve1-_t_solve0:.3f}s total={_t_solve1-_t_cand0:.3f}s")
         print(f"[xpress_reinsert] DEBUG solstatus={prob.attributes.solstatus} "
               f"batch={remove_ids} n_candidates={[(bi, len(c)) for bi, c in per_block.items()]}")
         if prob.attributes.solstatus not in (xp.SolStatus.OPTIMAL, xp.SolStatus.FEASIBLE):

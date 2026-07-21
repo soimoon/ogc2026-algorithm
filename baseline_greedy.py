@@ -71,7 +71,7 @@ import math
 import random
 import re
 import time
-from utils import Bay, Block, check_entry, check_exit, check_collisions, _resolve_layers, _bounding_box
+from utils import Bay, Block, check_entry, check_exit, check_collisions, _resolve_layers, _bounding_box, _bb_overlap
 
 
 # -----------------------------------------------------------------------------
@@ -165,6 +165,60 @@ def _candidate_positions(bay_w: float, bay_h: float,
     return candidates
 
 
+def _rank_candidates_by_earliest_bound(
+    candidates: list[tuple[int, int]],
+    blk_bb: tuple[float, float, float, float],
+    placed_in_bay: list["Block"],
+    schedule_in_bay: list[tuple[int, int]],
+    r_time: float,
+) -> list[tuple[int, int]]:
+    """
+    2026-07-21: cheap (AABB-only, no Shapely) re-ordering of candidate
+    positions by a LOWER BOUND on their achievable entry time, so a
+    subsequent cap on how many candidates get the expensive
+    _find_earliest_slot call (see CANDIDATE_SCAN_CAP) keeps the ones most
+    likely to actually be good instead of an arbitrary bottom-left-fill
+    prefix.
+
+    Motivation: _candidate_positions returns positions in bottom-left-fill
+    (x, y) order, which has no particular relationship to which positions
+    will yield an early ENTRY TIME once fed through _find_earliest_slot --
+    capping the raw list at CANDIDATE_SCAN_CAP without this re-ranking
+    measurably regressed solution quality (prob_1: obj1 went from 0 to
+    17-39, i.e. real tardiness appeared where the uncapped search always
+    found zero) because the specific position a later Phase-3 round needed
+    could simply never be scanned. This function doesn't fix that by
+    scanning more -- it fixes it by scanning the RIGHT ones first.
+
+    For each candidate (cx, cy), the new block's world bounding box is
+    compared (AABB only, not the full polygon) against every already-placed
+    block's bounding box; any overlap means this position cannot truly be
+    free until that block's exit_time at the earliest -- a correct LOWER
+    bound on the real answer (necessary, not sufficient: crane-sweep effects
+    _find_earliest_slot itself checks can still push the true earliest slot
+    later, but never earlier than this bound). Candidates with a lower bound
+    sort first.
+
+    O(len(candidates) * len(placed_in_bay)) simple float comparisons -- no
+    polygon work -- which profiling confirms costs a small fraction of even
+    a single _find_earliest_slot call.
+    """
+    lx0, ly0, lx1, ly1 = blk_bb
+    placed_boxes = [
+        (b.bounding_rect(), e) for b, (_, e) in zip(placed_in_bay, schedule_in_bay)
+    ]
+
+    def _lower_bound(cx: int, cy: int) -> float:
+        bx0, by0, bx1, by1 = cx + lx0, cy + ly0, cx + lx1, cy + ly1
+        bound = r_time
+        for (pbx0, pby0, pbx1, pby1), exit_t in placed_boxes:
+            if bx0 < pbx1 and pbx0 < bx1 and by0 < pby1 and pby0 < by1 and exit_t > bound:
+                bound = exit_t
+        return bound
+
+    return sorted(candidates, key=lambda c: _lower_bound(c[0], c[1]))
+
+
 # -----------------------------------------------------------------------------
 # Placement score (lower is better)
 # -----------------------------------------------------------------------------
@@ -250,7 +304,31 @@ def _find_earliest_slot(new_blk: Block,
       spatial collision check is run for these blocks to avoid producing
       Stage-4 violations that the repair loop cannot detect at placement time.
     """
-    candidate_entries = sorted({r_time} | {e for _, e in schedule_in_bay if e > r_time})
+    # 2026-07-21: spatial pre-filter, computed ONCE per call. new_blk's
+    # (x, y, orient_idx) are already fixed for the entire duration of this
+    # call -- only the candidate ENTRY TIME varies across iterations below
+    # -- so whether an existing block b is spatially close enough to
+    # possibly obstruct new_blk (their footprint AABBs overlap) has the SAME
+    # answer for every entry_candidate. A block whose AABB never overlaps
+    # new_blk's can never obstruct it at ANY time (check_entry/check_exit
+    # already reject on this exact AABB test internally -- see _bb_overlap
+    # in utils.py -- so this changes nothing about the result, it just does
+    # that check once instead of redundantly inside every iteration below).
+    # Profiling found this loop's block scan (both for candidate_entries and
+    # the Stage-4+ pre-check) was the dominant per-call cost -- a block in
+    # the opposite corner of a large, busy bay contributed its exit_time to
+    # candidate_entries and got scanned in the Stage-4+ loop on every single
+    # iteration, despite being physically incapable of ever obstructing this
+    # position.
+    new_bbox = new_blk.bounding_rect()
+    relevant = [
+        (b, sched) for b, sched in zip(placed_in_bay, schedule_in_bay)
+        if _bb_overlap(new_bbox, b.bounding_rect())
+    ]
+    relevant_blocks = [b for b, _ in relevant]
+    relevant_schedule = [sched for _, sched in relevant]
+
+    candidate_entries = sorted({r_time} | {e for _, e in relevant_schedule if e > r_time})
 
     for entry_candidate in candidate_entries:
         if deadline is not None and time.time() > deadline:
@@ -263,7 +341,7 @@ def _find_earliest_slot(new_blk: Block,
         # Mirrors check_feasibility: a_k < entry < e_k  (strict lower bound --
         # blocks entering at the same moment are handled by Stage-5 ordering).
         present_at_entry = [
-            b for b, (a, e) in zip(placed_in_bay, schedule_in_bay)
+            b for b, (a, e) in zip(relevant_blocks, relevant_schedule)
             if a < entry < e
         ]
         if check_entry(bay, present_at_entry, new_blk, fast=True):
@@ -272,7 +350,7 @@ def _find_earliest_slot(new_blk: Block,
         # Stage-3: blocks still present when new_blk departs.
         # Mirrors check_feasibility: a_k < exit_t < e_k  (strict both ends).
         present_at_exit = [new_blk] + [
-            b for b, (a, e) in zip(placed_in_bay, schedule_in_bay)
+            b for b, (a, e) in zip(relevant_blocks, relevant_schedule)
             if a < exit_t < e
         ]
         if check_exit(bay, present_at_exit, new_blk, fast=True):
@@ -298,7 +376,7 @@ def _find_earliest_slot(new_blk: Block,
         #   (b) b_other's *entry* falls inside new_blk's window (possible
         #       since blocks aren't necessarily placed in entry-time order).
         s4_blocked = False
-        for b_other, (a_other, e_other) in zip(placed_in_bay, schedule_in_bay):
+        for b_other, (a_other, e_other) in zip(relevant_blocks, relevant_schedule):
             if entry < a_other < exit_t:
                 # new_blk is present when b_other enters -- does new_blk
                 # obstruct b_other's already-scheduled entry?
@@ -432,6 +510,28 @@ def _find_latest_slot(new_blk: Block,
 # and block happen to have.
 CANDIDATE_DIVERSITY_MAX_DEGRADE_FRAC = 0.1
 
+# 2026-07-21: hard cap on how many (position, feasibility-check) pairs get
+# evaluated per (block, bay, orientation) -- fully independent budget, never
+# shared across bays or orientations (see _rank_candidates_by_earliest_bound
+# and the per-(bay, orientation) reset comments at each call site for why:
+# any sharing let one bay/orientation exhaust the budget and starve the
+# others entirely, which measurably regressed quality far worse than a
+# small cap value ever did). Candidates are re-sorted by a cheap AABB lower
+# bound before capping (_rank_candidates_by_earliest_bound), not left in
+# raw bottom-left-fill order, so a small cap still reliably includes the
+# genuinely best candidates -- confirmed directly: the true winning
+# candidate ranked within the cap in 10/10 sampled blocks. Profiling found
+# _candidate_positions can return thousands of positions for a single block
+# in a densely-packed bay (e.g. ~3,756 measured for prob_1), each triggering
+# a full _find_earliest_slot call averaging ~2ms -- the dominant cost in
+# every Phase-3 round measured (candidate generation was 99%+ of total round
+# time; the actual MIP solve was <0.02s). 200 (safe but only modestly
+# faster, since full independence means the worst-case total is
+# n_bays * n_orientations * cap) was the first validated-safe value; 50
+# trades a smaller per-combo exploration for a much lower worst-case total,
+# still validated safe via the same AABB ranking guarantee.
+CANDIDATE_SCAN_CAP = 50
+
 def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
                               bay_placed: list[list[Block]],
                               bay_schedule: list[list[tuple[int, int]]],
@@ -468,6 +568,44 @@ def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
     bay_ids_to_search = [restrict_bay_id] if restrict_bay_id is not None else range(len(bays))
 
     scored: list[tuple] = []
+    # 2026-07-21: budget is PER BAY (reset for each bay_id, shared only
+    # across that bay's own orientations) -- see CANDIDATE_SCAN_CAP's
+    # docstring. Two earlier designs both failed: resetting per-orientation
+    # let n_orientations multiply the total cost right back up; sharing ONE
+    # budget across the whole block (all bays combined) let a single
+    # congested bay consume the entire budget and starve every OTHER bay
+    # from being explored at all -- measured as a severe quality regression
+    # in _place_blocks (the analogous single-choice search, see its own
+    # comment) traced to exactly this: a block's most-preferred bay eating
+    # the whole budget meant a much emptier second bay was never even
+    # sampled. Per-bay budgets can't have that failure mode -- every bay
+    # that gets reached always gets its own fair look.
+    # No "stop once an ideal-timing candidate is found" early exit here (an
+    # earlier version had one) -- this feeds a joint MIP's candidate POOL,
+    # and stopping early can starve it of a candidate that scores slightly
+    # worse alone but would have made a better JOINT combination (avoiding a
+    # pairwise conflict with another block in the same batch). Measured on
+    # _place_blocks (the analogous single-choice search): an ideal-only
+    # early exit there regressed prob_1's obj1 from 0 to 17 (real tardiness
+    # appeared) because _placement_score can't see everything that matters
+    # about a position. Bound the raw candidate COUNT only.
+    # 2026-07-21: budget resets per (bay, orientation) -- NOT shared with
+    # anything, including other orientations of the same bay. An earlier
+    # version shared one budget across all orientations within a bay (to
+    # avoid n_orientations multiplying the per-bay cost back up); measured
+    # to reintroduce the exact same starvation failure mode as the
+    # shared-across-bays bug, just one level down: an early orientation
+    # could exhaust the bay's whole budget before a later orientation (which
+    # might hold the actually-best candidate) ever got scanned at all.
+    # Confirmed via analysis/diagnose_ranking-style direct comparison: the
+    # AABB lower-bound ranking itself is accurate (the true-best candidate
+    # ranked within the cap in 10/10 sampled blocks), so the remaining
+    # failures had to be a starvation bug, not a ranking-quality one. Fully
+    # independent per-(bay, orientation) budgets cannot starve each other by
+    # construction -- the tradeoff is a higher worst-case total scan count
+    # (bounded by n_bays * n_orientations * CANDIDATE_SCAN_CAP), acceptable
+    # since the AABB ranking already keeps each individual budget's spend
+    # worthwhile.
     for bay_id in bay_ids_to_search:
         bay = bays[bay_id]
         if deadline is not None and time.time() > deadline:
@@ -475,9 +613,17 @@ def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
         placed_in_bay = bay_placed[bay_id]
         schedule_in_bay = bay_schedule[bay_id]
         for oi, _ in enumerate(blk_data["shape"]):
+            scan_budget = CANDIDATE_SCAN_CAP
             blk_bb = _block_bbox(blk_data, oi)
             candidates = _candidate_positions(bay.width, bay.height, placed_in_bay, blk_bb)
+            if len(candidates) > scan_budget:
+                candidates = _rank_candidates_by_earliest_bound(
+                    candidates, blk_bb, placed_in_bay, schedule_in_bay, r_time
+                )
             for cx, cy in candidates:
+                if scan_budget <= 0:
+                    break
+                scan_budget -= 1
                 if deadline is not None and time.time() > deadline:
                     break
                 new_blk = Block(block_id=bi, block_data=blk_data, x=cx, y=cy, orient_idx=oi)
@@ -1411,6 +1557,21 @@ def _place_blocks(
             # by more than a handful of candidate evaluations.
             deadline_hit = False
             bay_order = sorted(range(n_bays), key=lambda j: prefs[j], reverse=True)
+            # 2026-07-21: budget is PER BAY (reset for each bay_id) -- see
+            # CANDIDATE_SCAN_CAP's docstring and _top_candidates_for_block's
+            # matching comment. A single shared-across-all-bays budget let
+            # this block's most-preferred (and possibly most congested) bay
+            # consume the whole thing, meaning a much emptier second bay was
+            # never even sampled -- measured directly: prob_1's Phase 1
+            # obj went from the correct 68,633 (obj1=0) to 1,666,716+ with a
+            # shared budget, because blocks kept getting stuck in a
+            # congested top-preference bay instead of trying the other one.
+            # 2026-07-21: budget resets per (bay, orientation), not shared
+            # across orientations either -- see _top_candidates_for_block's
+            # matching comment for the full story (an orientation-sharing
+            # version reintroduced the same starvation bug one level down:
+            # an early orientation could exhaust a bay's whole budget before
+            # a later, possibly-better orientation was ever scanned).
             for bay_id in bay_order:
                 if deadline_hit:
                     break
@@ -1421,6 +1582,7 @@ def _place_blocks(
                 for oi in range(n_orient):
                     if deadline_hit:
                         break
+                    scan_budget = CANDIDATE_SCAN_CAP
                     blk_bb = _block_bbox(blk_data, oi)
                     lx0_oi, ly0_oi, lx1_oi, ly1_oi = blk_bb
                     # Require a valid integer reference-point position to exist:
@@ -1438,7 +1600,29 @@ def _place_blocks(
                     candidates = _candidate_positions(
                         bay.width, bay.height, active_in_bay, blk_bb
                     )
+                    if len(candidates) > scan_budget:
+                        candidates = _rank_candidates_by_earliest_bound(
+                            candidates, blk_bb, placed_in_bay, schedule_in_bay, r_time
+                        )
+                    # 2026-07-21: same scan cap as _top_candidates_for_block --
+                    # see CANDIDATE_SCAN_CAP's docstring. Unlike that function
+                    # (which only feeds a joint MIP's candidate POOL), here
+                    # the single position picked directly determines the
+                    # committed layout for this Phase-1/repair placement --
+                    # an early "found one with ideal timing, stop comparing"
+                    # exit was tried and measurably regressed quality (prob_1
+                    # went from obj1=0 to obj1=17 -- real tardiness appeared
+                    # where none existed before), because _placement_score's
+                    # top_y tie-break doesn't capture how much a given (x, y)
+                    # choice obstructs or enables FUTURE blocks' placements,
+                    # only its own immediate score. Bound the raw candidate
+                    # COUNT via scan_budget only -- still compare every
+                    # candidate within that budget by score, same as before
+                    # this change, just capped instead of unbounded.
                     for cx, cy in candidates:
+                        if scan_budget <= 0:
+                            break
+                        scan_budget -= 1
                         if effective_deadline is not None and time.time() > effective_deadline:
                             deadline_hit = True
                             break
@@ -1898,7 +2082,6 @@ def _improve(prob_info: dict,
             timelimit: float,
             atc_k: float = 2.0,
             k_values: tuple[int, ...] | None = None,
-            stall_limit: int | None = None,
             annealing: bool = False,
             initial_temp_frac: float = 0.01,
             cooling_rate: float = 0.98,
@@ -1971,14 +2154,17 @@ def _improve(prob_info: dict,
 
     Parameters
     ----------
-    stall_limit : stop early after this many consecutive rounds with no new
-                  *best* (default 3 * len(k_values)). Purely a wall-clock
-                  courtesy for local testing -- returning early vs. running
-                  to the deadline doesn't affect the score either way, since
-                  the leaderboard only sees the final returned solution.
     seed        : RNG seed for the annealing accept/reject draw and the
                   operator-selection/random-destroy draws. None (default)
                   means an unseeded, naturally varying run each time.
+
+    Stops early once no new best has been found for STALL_TIME_FRAC of the
+    Phase-3 time budget (see that constant below) -- unlike the earlier
+    fixed-round-count version, this scales automatically with however fast
+    or slow individual rounds happen to be, so it can't strand unused
+    wall-clock budget just because rounds got cheaper. Early return here
+    isn't wasted either way: myalgorithm._iterated_greedy can spend
+    whatever's left on a fresh restart with a different seed.
     """
     from utils import check_feasibility, check_feasibility_incremental
 
@@ -1986,7 +2172,7 @@ def _improve(prob_info: dict,
     # can't unblock a structural issue that needs a bigger reshuffle. Mix in
     # much larger removal sizes (up to n/3) alongside the original small
     # ones, capped so a single round never removes more than a third of the
-    # instance. Resolved here (before stall_limit, which depends on it).
+    # instance.
     if k_values is None:
         n = len(blocks_data)
         cap = max(1, n // 3)
@@ -1994,8 +2180,6 @@ def _improve(prob_info: dict,
             k for k in (1, 2, 3, 5, 8, 12, max(1, n // 10), max(1, n // 5))
             if k <= cap
         }))
-
-    _stall_limit_arg = stall_limit
 
     def _build(a: dict[int, dict]) -> dict:
         return {"operations": _build_operations(list(a.values()))}
@@ -2022,6 +2206,21 @@ def _improve(prob_info: dict,
     round_idx = 0
     stalled = 0
     empty_operators_seen: set[str] = set()
+    # 2026-07-21: stall detection switched from a fixed ROUND count to a
+    # fraction of the remaining wall-clock budget. The round-count version
+    # (3 * len(k_values) * len(operator_names)) was calibrated back when
+    # ~10-15 rounds fit in a typical budget -- today's candidate-generation
+    # speedups (spatial pre-filtering in _find_earliest_slot, per-(bay,
+    # orientation) capped+ranked candidate scan) can make rounds cheap
+    # enough that this fixed count gets reached with most of the time
+    # budget still unused, stopping the search early for no real reason
+    # (see notes/algorithm_overview.md). A time-based threshold scales
+    # automatically with however fast rounds happen to be, instead of
+    # needing to be re-tuned every time per-round cost changes. `stalled`
+    # (the round counter) is kept only for the log line, not the decision.
+    STALL_TIME_FRAC = 0.25
+    phase3_loop_start = time.time()
+    last_improvement_time = phase3_loop_start
     # 2026-07-20: proper ALNS-style adaptive operator selection, replacing
     # the earlier fixed escalation+pruning scheme. Each operator (destroy
     # mode) has a weight; each round, one operator is picked by
@@ -2048,17 +2247,6 @@ def _improve(prob_info: dict,
                       if z2z3_modes else ["tardy", "swap", "wholebay"])
     op_weight: dict[str, float] = {name: 1.0 for name in operator_names}
     Z1_URGENCY_BOOST = 3.0  # see the round-selection weights computation below
-
-    if _stall_limit_arg is None:
-        # 2026-07-21: scaled by len(operator_names) (evaluated once here,
-        # before any Z1-lower-bound pruning shrinks it) to roughly preserve
-        # the old pass-based scheme's effective patience now that each round
-        # is a single weighted-random trial instead of a whole pass through
-        # every operator -- see the round-loop rewrite below for why passes
-        # were removed.
-        stall_limit = 3 * len(k_values) * len(operator_names)
-    else:
-        stall_limit = _stall_limit_arg
 
     # 2026-07-20: Z1's theoretical lower bound (see analysis/lower_bound.py --
     # sum of each block's own release_time+processing_time-due_date floor,
@@ -2300,34 +2488,27 @@ def _improve(prob_info: dict,
             )
         trial_assignments.update(partial)
 
-        trial_result = check_feasibility(prob_info, _build(trial_assignments))
-        # 2026-07-21: shadow-validate the new incremental checker against the
-        # full one on every single round -- see check_feasibility_incremental's
-        # docstring for why this must stay in "compare but never trust alone"
-        # mode until it has accumulated a large, divergence-free track record.
-        # trial_result (the FULL check, above) remains the only thing that
-        # affects accept/reject below; this block only observes and logs.
+        # 2026-07-21: cut over from "full check every round" to "incremental
+        # check every round, full check only to CONFIRM an accept" -- see
+        # check_feasibility_incremental's docstring and this session's
+        # shadow-validation track record (157/157 divergence-free) before
+        # this change. Most rounds end up REJECTED, and a rejected trial
+        # never touches current_assignments -- if the incremental checker is
+        # ever wrong there, the only cost is a missed opportunity, not
+        # corrupted state. current_assignments is what every FUTURE
+        # incremental check's "already known feasible" precondition depends
+        # on, though, so the one moment that actually mutates it (an accept,
+        # whether NEW BEST or an annealing/epsilon-relax walk step) still
+        # gets a full check_feasibility as a mandatory confirmation gate
+        # below, before the mutation happens.
         try:
-            inc_result = check_feasibility_incremental(
+            trial_result = check_feasibility_incremental(
                 prob_info, current_assignments, trial_assignments, set(remove_ids)
             )
-            _mismatch = inc_result["feasible"] != trial_result["feasible"]
-            if not _mismatch and trial_result["feasible"]:
-                for _key in ("objective", "obj1", "obj2", "obj3"):
-                    if abs(inc_result[_key] - trial_result[_key]) > 1e-3:
-                        _mismatch = True
-                        break
-            elif not _mismatch and not trial_result["feasible"]:
-                _mismatch = inc_result["stage"] != trial_result["stage"]
-            if _mismatch:
-                print(f"[Greedy] *** INCREMENTAL-CHECK MISMATCH *** mode={mode} k={k} "
-                      f"removed={remove_ids}  full=(feasible={trial_result['feasible']}, "
-                      f"stage={trial_result.get('stage')}, obj={trial_result.get('objective')})  "
-                      f"inc=(feasible={inc_result['feasible']}, stage={inc_result.get('stage')}, "
-                      f"obj={inc_result.get('objective')})")
         except Exception as _inc_exc:
             print(f"[Greedy] *** INCREMENTAL-CHECK RAISED *** mode={mode} k={k}  "
-                  f"{type(_inc_exc).__name__}: {_inc_exc}")
+                  f"{type(_inc_exc).__name__}: {_inc_exc} -- falling back to full check this round")
+            trial_result = check_feasibility(prob_info, _build(trial_assignments))
 
         round_idx += 1
         solver_tag = ("direct-rebalance" if used_direct
@@ -2339,8 +2520,9 @@ def _improve(prob_info: dict,
             print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} via={solver_tag}  "
                   f"infeasible, rejected  w={op_weight[mode]:.2f}")
             stalled += 1
-            if stalled >= stall_limit:
-                print(f"[Greedy] Improve: no new best for {stalled} rounds, stopping early  "
+            if time.time() - last_improvement_time > STALL_TIME_FRAC * (deadline - phase3_loop_start):
+                print(f"[Greedy] Improve: no new best for {stalled} rounds / "
+                      f"{time.time() - last_improvement_time:.1f}s, stopping early  "
                       f"round={round_idx}")
                 break
             continue
@@ -2373,11 +2555,40 @@ def _improve(prob_info: dict,
                   f"rejected obj={trial_result['objective']:.0f} (T={temperature:.3g})  "
                   f"w={op_weight[mode]:.2f}")
             stalled += 1
-            if stalled >= stall_limit:
-                print(f"[Greedy] Improve: no new best for {stalled} rounds, stopping early  "
+            if time.time() - last_improvement_time > STALL_TIME_FRAC * (deadline - phase3_loop_start):
+                print(f"[Greedy] Improve: no new best for {stalled} rounds / "
+                      f"{time.time() - last_improvement_time:.1f}s, stopping early  "
                       f"round={round_idx}")
                 break
             continue
+
+        # 2026-07-21: mandatory confirmation gate -- about to mutate
+        # current_assignments (the base every future incremental check
+        # trusts as "already feasible"), so re-verify with the FULL,
+        # from-scratch check_feasibility before committing. If the
+        # incremental checker was wrong here, correctness would silently
+        # cascade into every subsequent round's "affected blocks" delta
+        # instead of staying contained to this one throwaway trial -- unlike
+        # a wrongly-rejected trial, which costs nothing but a missed move.
+        confirm_result = check_feasibility(prob_info, _build(trial_assignments))
+        confirm_mismatch = confirm_result["feasible"] != trial_result["feasible"]
+        if not confirm_mismatch and confirm_result["feasible"]:
+            confirm_mismatch = abs(confirm_result["objective"] - trial_result["objective"]) > 1e-3
+        if confirm_mismatch:
+            print(f"[Greedy] *** INCREMENTAL-CHECK MISMATCH at accept gate *** mode={mode} k={k} "
+                  f"removed={remove_ids}  inc=(feasible={trial_result['feasible']}, "
+                  f"obj={trial_result.get('objective')})  full=(feasible={confirm_result['feasible']}, "
+                  f"stage={confirm_result.get('stage')}, obj={confirm_result.get('objective')})  "
+                  f"-- rejecting this trial and keeping current state")
+            op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_REJECTED
+            stalled += 1
+            if time.time() - last_improvement_time > STALL_TIME_FRAC * (deadline - phase3_loop_start):
+                print(f"[Greedy] Improve: no new best for {stalled} rounds / "
+                      f"{time.time() - last_improvement_time:.1f}s, stopping early  "
+                      f"round={round_idx}")
+                break
+            continue
+        trial_result = confirm_result  # authoritative values from here on
 
         current_assignments = trial_assignments
         current_obj = trial_result["objective"]
@@ -2388,6 +2599,7 @@ def _improve(prob_info: dict,
             best_obj = current_obj
             best_obj1 = trial_result["obj1"]
             stalled = 0
+            last_improvement_time = time.time()
             op_weight[mode] = WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_NEW_BEST
             elapsed = time.time() - t_start
             # 2026-07-20 bugfix: this print (which reads op_weight[mode])
