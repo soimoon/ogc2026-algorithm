@@ -1980,7 +1980,7 @@ def _improve(prob_info: dict,
                   operator-selection/random-destroy draws. None (default)
                   means an unseeded, naturally varying run each time.
     """
-    from utils import check_feasibility
+    from utils import check_feasibility, check_feasibility_incremental
 
     # Larger destroy sizes (2026-07-20): a single relocate or a 5-block swap
     # can't unblock a structural issue that needs a bigger reshuffle. Mix in
@@ -2301,6 +2301,34 @@ def _improve(prob_info: dict,
         trial_assignments.update(partial)
 
         trial_result = check_feasibility(prob_info, _build(trial_assignments))
+        # 2026-07-21: shadow-validate the new incremental checker against the
+        # full one on every single round -- see check_feasibility_incremental's
+        # docstring for why this must stay in "compare but never trust alone"
+        # mode until it has accumulated a large, divergence-free track record.
+        # trial_result (the FULL check, above) remains the only thing that
+        # affects accept/reject below; this block only observes and logs.
+        try:
+            inc_result = check_feasibility_incremental(
+                prob_info, current_assignments, trial_assignments, set(remove_ids)
+            )
+            _mismatch = inc_result["feasible"] != trial_result["feasible"]
+            if not _mismatch and trial_result["feasible"]:
+                for _key in ("objective", "obj1", "obj2", "obj3"):
+                    if abs(inc_result[_key] - trial_result[_key]) > 1e-3:
+                        _mismatch = True
+                        break
+            elif not _mismatch and not trial_result["feasible"]:
+                _mismatch = inc_result["stage"] != trial_result["stage"]
+            if _mismatch:
+                print(f"[Greedy] *** INCREMENTAL-CHECK MISMATCH *** mode={mode} k={k} "
+                      f"removed={remove_ids}  full=(feasible={trial_result['feasible']}, "
+                      f"stage={trial_result.get('stage')}, obj={trial_result.get('objective')})  "
+                      f"inc=(feasible={inc_result['feasible']}, stage={inc_result.get('stage')}, "
+                      f"obj={inc_result.get('objective')})")
+        except Exception as _inc_exc:
+            print(f"[Greedy] *** INCREMENTAL-CHECK RAISED *** mode={mode} k={k}  "
+                  f"{type(_inc_exc).__name__}: {_inc_exc}")
+
         round_idx += 1
         solver_tag = ("direct-rebalance" if used_direct
                      else "wholebay-xpress" if used_wholebay
