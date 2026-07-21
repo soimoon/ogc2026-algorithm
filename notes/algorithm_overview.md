@@ -205,6 +205,13 @@
     **광범위 검증(대표 8개 인스턴스, 3차 제출본 대비, 180초)**: **8전 8승**, 그중 다수가 자릿수 단위 개선 -- prob_9 -98.5%(67배), prob_20 -98.7%(77배), prob_31 -98.9%(88배), prob_23 -88.9%(9배), prob_40 -71.9%(3.6배), prob_1 -86.8%, prob_17 -19.2%, prob_5 -2.8%. 40개 전체 로버스트니스(20초)도 40/40 feasible·크래시 0·시간초과 0 유지.
     **결론**: 오늘 하루의 변경들이 사슬처럼 이어진 결과 -- 후보생성 속도 개선(39/40번) → 라운드가 빨라짐 + 시간 기준으로 적절히 멈춤(41번) → 재시작이 실제로 여러 번 발동 → 서로 다른 construction 기반을 실제로 탐색 → 훨씬 나은 해 발견. 이 중 하나만 있었다면 이 정도 효과는 안 나왔을 것.
 
+42. **위험 사고 방지: `check_feasibility_incremental`이 잘못 `utils.py`에 들어가 있었던 것을 발견/수정 -- 4차 제출 패키징 직전 (2026-07-21)**
+    37번에서 증분 검증기를 만들 때 위치 선정을 잘못해서 `utils.py`에 추가해버렸음. 그런데 `utils.py`는 **채점 서버가 매 실행마다 자기 원본으로 덮어쓰는 파일**(제출 zip에 넣어도 무시됨, 원본은 `baseline/utils.py`에서 확인 가능) -- 부정행위 방지를 위한 장치로, 지금까지의 모든 제출 zip 구성(`myalgorithm.py`+`baseline_greedy.py`+`xpress_reinsert.py`, `utils.py` 미포함)이 우연히 이 구조와 맞아떨어졌던 것뿐이었음. 4차 제출을 패키징하려던 직전에 사용자가 직접 발견 -- 그대로 제출했다면 실채점 시 `from utils import check_feasibility_incremental`이 `ImportError`를 내고, 모든 인스턴스가 `myalgorithm._emergency_fallback`으로 떨어져 사실상 전멸했을 것(오늘 로컬 검증은 전부 로컬의 온전한 `utils.py`를 그대로 썼기 때문에 이 버그를 전혀 못 잡아냈음).
+    **정당성 확인**: 이 최적화 자체는 부정행위 방지 장치가 막으려는 종류의 꼼수가 아님 -- (a) 매 채택(accept) 시점마다 원본 `check_feasibility` 전체 검증이 여전히 게이트로 걸려 있고(38번), (b) 최종 반환 솔루션은 항상 `myalgorithm.py`의 verify-before-return 단계에서 원본 `check_feasibility`로 재검증되며, (c) 하네스도 독립적으로 최종 결과를 재검증함. 즉 "내부 탐색 루프를 더 싸게 재검증하는 방법"일 뿐 검증 기준 자체를 바꾸지 않음 -- 다만 이 정당성과 무관하게, **파일 위치 자체가 채점 서버 제약을 어겼으므로 반드시 수정이 필요했음**.
+    **수정**: `check_feasibility_incremental` 함수 전체를 `baseline_greedy.py`로 이전(`_improve` 바로 앞, `_select_removal_candidates` 뒤에 배치) -- 이 파일은 매 제출 zip에 항상 포함되는 파일. `utils.py`는 `C:\Users\nympe\Downloads\baseline-latest-oxXm57Lz\ogc2026\baseline\utils.py`(원본)과 `diff`로 완전히 동일함을 확인할 때까지 복원(1440줄, 끝에 빈 줄 1개 포함). `_improve` 내부의 `from utils import check_feasibility, check_feasibility_incremental`을 `from utils import check_feasibility`로 수정(이제 같은 파일 안의 함수라 import 불필요).
+    **검증**: `ast.parse` 문법 체크 통과(양쪽 파일), `import baseline_greedy, utils, myalgorithm, xpress_reinsert`로 실제 로드 확인 + `hasattr` 로 함수가 정확히 `baseline_greedy`에만 있고 `utils`엔 없음을 확인. prob_1 스모크 테스트(60초, `myalgorithm.algorithm` 경유, 재시작 포함) -- feasible, obj=68633, `INCREMENTAL-CHECK MISMATCH` 로그 없음, 크래시 없음 -- 이전(버그 있던 상태)과 동일한 동작 확인(로컬은 두 파일 어디에 함수가 있든 코드베이스 합은 동일하므로 당연한 결과지만, import 경로 자체가 깨지지 않았음을 재확인).
+    **교훈**: 채점 서버가 특정 파일을 덮어쓴다는 제약은 코드로는 전혀 드러나지 않는 암묵적 규칙이라, "새 함수를 어디에 넣을지" 결정할 때마다 매번 의식적으로 확인해야 함 -- 다음에 새 유틸 함수를 추가할 때는 항상 `myalgorithm.py`/`baseline_greedy.py`/`xpress_reinsert.py` 중 하나에 넣을 것, `utils.py`는 읽기 전용으로 취급.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
