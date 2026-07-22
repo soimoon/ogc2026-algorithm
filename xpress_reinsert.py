@@ -56,6 +56,28 @@ CROSS_INJECT_MAX_K = 5
 # out genuinely-plausible swaps.
 CROSS_INJECT_SIZE_SLACK = 1.3
 
+# 2026-07-22 (experiment/same-bay-first branch): toggle for A/B-testing
+# whether the same-bay-first fast path (see reinsert()'s call site) is
+# trapping blocks in a congested bay by never even generating an
+# other-bay candidate once the current bay alone fills max_per_block --
+# see notes/ogc2026_p4p6_investigation memory, hypothesis #1. False reverts
+# to the original unconditional all-bays scan.
+#
+# Investigated 2026-07-22: naive block-DUPLICATE stress instances (x4/x8,
+# same 250 blocks repeated) gave inconsistent, direction-flipping results
+# (OFF ~1% better at x4, ON ~1.7% better at x8) -- these turned out to be a
+# poor proxy, since duplicating identical blocks creates an artificial
+# preference-clustering that a real large/heterogeneous instance wouldn't
+# have to the same degree. A more realistic test (1000 blocks pooled from 5
+# DIFFERENT local instances, each keeping its own shape/preferences) showed
+# ON consistently better across 4 repeated runs (4-15% margin, direction
+# never flipped) -- same-bay-first does NOT look like the P4-6 stagnation's
+# culprit after all, and may genuinely help on realistic heterogeneous
+# instances. Kept enabled (True) as the default; this toggle is left in
+# place as a debug/re-verification knob, not because the investigation is
+# still open.
+SAME_BAY_FIRST_ENABLED = True
+
 
 def _time_overlaps(a0: float, a1: float, b0: float, b1: float) -> bool:
     return a0 < b1 and b0 < a1
@@ -284,7 +306,7 @@ def reinsert(remove_ids: list[int],
             # whose current bay genuinely has no good options left), only in
             # the case where its current bay already has plenty.
             cands = None
-            if restrict_bay_id is None and current_positions is not None and bi in current_positions:
+            if SAME_BAY_FIRST_ENABLED and restrict_bay_id is None and current_positions is not None and bi in current_positions:
                 own_bay = current_positions[bi][0]
                 same_bay_cands = _candidates_for_block(
                     bi, blocks_data[bi], bays, bay_placed, bay_schedule, bay_loads,
