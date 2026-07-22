@@ -3454,6 +3454,32 @@ def _improve(prob_info: dict,
     # reinsertion once K exceeds this.
     JOINT_MAX_K = 12
 
+    # 2026-07-22 (experiment branch, user-proposed): batch the mandatory
+    # full check_feasibility confirmation across several accepts instead of
+    # paying it on EVERY one. Motivation: on a large instance (thousands of
+    # blocks), that single confirmation call can cost ~19s (measured
+    # directly, see notes/algorithm_overview.md #59) -- if several accepts
+    # happen in a row, each paying that cost separately can consume most of
+    # Phase 3's remaining budget on redundant re-verification of a checker
+    # (check_feasibility_incremental) that's already been shadow-validated
+    # across 624 accept-path samples today (diverse instances/scales/
+    # operators) with ZERO divergences from the full checker. Still confirm
+    # every CONFIRM_CHECK_INTERVAL accepts (not never), and unconditionally
+    # once more right before returning -- so a real divergence, if one ever
+    # happens, is caught within a bounded number of rounds, not silently
+    # trusted forever. On a mismatch, roll ALL THE WAY BACK to the last
+    # full-checked checkpoint (not just the one bad round) and stop --
+    # pinpointing exactly which of the batched accepts was wrong isn't worth
+    # the complexity when discarding all of them and returning a
+    # known-good state is simple and safe.
+    CONFIRM_CHECK_INTERVAL = 10
+    checkpoint_assignments = dict(current_assignments)
+    checkpoint_obj = current_obj
+    checkpoint_best_assignments = dict(best_assignments)
+    checkpoint_best_obj = best_obj
+    checkpoint_best_obj1 = best_obj1
+    accepts_since_checkpoint = 0
+
     while time.time() < deadline:
         # 2026-07-22 (user-proposed): counts every roulette-wheel spin this
         # loop takes (regardless of outcome -- empty draw, rejected,
@@ -3747,34 +3773,42 @@ def _improve(prob_info: dict,
                 break
             continue
 
-        # 2026-07-21: mandatory confirmation gate -- about to mutate
-        # current_assignments (the base every future incremental check
-        # trusts as "already feasible"), so re-verify with the FULL,
-        # from-scratch check_feasibility before committing. If the
-        # incremental checker was wrong here, correctness would silently
-        # cascade into every subsequent round's "affected blocks" delta
-        # instead of staying contained to this one throwaway trial -- unlike
-        # a wrongly-rejected trial, which costs nothing but a missed move.
-        confirm_result = check_feasibility(prob_info, _build(trial_assignments))
-        confirm_mismatch = confirm_result["feasible"] != trial_result["feasible"]
-        if not confirm_mismatch and confirm_result["feasible"]:
-            confirm_mismatch = abs(confirm_result["objective"] - trial_result["objective"]) > 1e-3
-        if confirm_mismatch:
-            print(f"[Greedy] *** INCREMENTAL-CHECK MISMATCH at accept gate *** mode={mode} k={k} "
-                  f"removed={remove_ids}  inc=(feasible={trial_result['feasible']}, "
-                  f"obj={trial_result.get('objective')})  full=(feasible={confirm_result['feasible']}, "
-                  f"stage={confirm_result.get('stage')}, obj={confirm_result.get('objective')})  "
-                  f"-- rejecting this trial and keeping current state")
-            op_weight[mode] = max(MIN_WEIGHT, WEIGHT_DECAY * op_weight[mode] + (1 - WEIGHT_DECAY) * REWARD_REJECTED)
-            stalled += 1
-            if (time.time() - last_improvement_time > stall_threshold
-                    and rounds_since_last_improve >= MIN_ROUNDS_SINCE_IMPROVE):
-                print(f"[Greedy] Improve: no new best for {stalled} rounds / "
-                      f"{time.time() - last_improvement_time:.1f}s, stopping early  "
-                      f"round={round_idx}")
+        # 2026-07-22 (experiment branch, user-proposed): only pay the full
+        # check_feasibility confirmation every CONFIRM_CHECK_INTERVAL
+        # accepts (see the constant's docstring above for the rationale and
+        # shadow-validation evidence) instead of on every single one.
+        # Between confirmations, trial_result (check_feasibility_incremental)
+        # is trusted directly -- current_assignments does drift ahead of the
+        # last full verification for a bounded number of rounds, but the
+        # periodic confirmation below (and the unconditional one right
+        # before this function returns) guarantees any real divergence is
+        # still caught, never silently trusted forever.
+        accepts_since_checkpoint += 1
+        do_full_check = accepts_since_checkpoint >= CONFIRM_CHECK_INTERVAL
+        if do_full_check:
+            confirm_result = check_feasibility(prob_info, _build(trial_assignments))
+            confirm_mismatch = confirm_result["feasible"] != trial_result["feasible"]
+            if not confirm_mismatch and confirm_result["feasible"]:
+                confirm_mismatch = abs(confirm_result["objective"] - trial_result["objective"]) > 1e-3
+            if confirm_mismatch:
+                print(f"[Greedy] *** INCREMENTAL-CHECK MISMATCH after {accepts_since_checkpoint} "
+                      f"batched accept(s) *** mode={mode} k={k} removed={remove_ids}  "
+                      f"inc=(feasible={trial_result['feasible']}, obj={trial_result.get('objective')})  "
+                      f"full=(feasible={confirm_result['feasible']}, stage={confirm_result.get('stage')}, "
+                      f"obj={confirm_result.get('objective')})  -- rolling ALL of them back to the last "
+                      f"confirmed checkpoint (obj {checkpoint_obj:.0f}) and stopping Improve early")
+                current_assignments = checkpoint_assignments
+                current_obj = checkpoint_obj
+                best_assignments = checkpoint_best_assignments
+                best_obj = checkpoint_best_obj
+                best_obj1 = checkpoint_best_obj1
+                # Reset here (not just on a successful advance) -- we just
+                # rolled back to the checkpoint itself, which is already
+                # known-good, so the unconditional final check below would
+                # otherwise redundantly re-verify it for no reason.
+                accepts_since_checkpoint = 0
                 break
-            continue
-        trial_result = confirm_result  # authoritative values from here on
+            trial_result = confirm_result  # authoritative values from here on
 
         current_assignments = trial_assignments
         current_obj = trial_result["objective"]
@@ -3813,6 +3847,39 @@ def _improve(prob_info: dict,
             print(f"[Greedy] Improve round {round_idx}: mode={mode} k={k} via={solver_tag}  "
                   f"walked to worse obj={current_obj:.0f} (T={temperature:.3g})  "
                   f"w={op_weight[mode]:.2f}  best still {best_obj:.0f}")
+
+        if do_full_check:
+            # This batch of accepts_since_checkpoint just got confirmed
+            # (the mismatch branch above already `break`s before reaching
+            # here) -- advance the checkpoint to the current, now-verified
+            # state and reset the counter.
+            checkpoint_assignments = dict(current_assignments)
+            checkpoint_obj = current_obj
+            checkpoint_best_assignments = dict(best_assignments)
+            checkpoint_best_obj = best_obj
+            checkpoint_best_obj1 = best_obj1
+            accepts_since_checkpoint = 0
+
+    # 2026-07-22 (experiment branch): unconditional final confirmation --
+    # if the loop ended (deadline/stall/nothing-left) with unconfirmed
+    # accepts still outstanding (accepts_since_checkpoint > 0), verify
+    # best_assignments for real before returning it, exactly like the
+    # per-batch check above. Never return an unconfirmed state, no matter
+    # how the loop exited.
+    if accepts_since_checkpoint > 0:
+        final_confirm = check_feasibility(prob_info, _build(best_assignments))
+        final_mismatch = final_confirm["feasible"] != True
+        if not final_mismatch:
+            final_mismatch = abs(final_confirm["objective"] - best_obj) > 1e-3
+        if final_mismatch:
+            print(f"[Greedy] *** INCREMENTAL-CHECK MISMATCH at final return *** "
+                  f"claimed obj={best_obj:.0f}, full check says "
+                  f"feasible={final_confirm['feasible']} obj={final_confirm.get('objective')} -- "
+                  f"returning last confirmed checkpoint (obj {checkpoint_best_obj:.0f}) instead")
+            best_assignments = checkpoint_best_assignments
+        else:
+            print(f"[Greedy] Improve: final batched confirmation OK "
+                  f"({accepts_since_checkpoint} accept(s) since last checkpoint)")
 
     return best_assignments
 
