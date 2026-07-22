@@ -247,3 +247,17 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 - **정책적 변경(방금 완료)**: Phase1 예산 적응형 축소
 
 사용자 질문("P4-6에 자릿수 단위 개선 가능?", "P1 악화 해결될까?")에 대한 답: **둘 다 낙관 어려움.** 오늘 것들의 실측 효과는 "덜 흔들림"이지 "극적 개선"이 아니고, P4-6 규모 자체가 미확인이라 오늘 변경이 적용될지도 불확실. P1의 5차 악화 원인은 여전히 미확인 상태(same-bay-first는 범인 아님으로 결론났지만 대체 원인 특정 못함) -- 다음 조사 과제로 남음.
+
+## 2026-07-22 (이어서 11) -- 재시작마다 priority_rule 다양화 (5차 이후 근본 돌파 논의)
+
+사용자 제안: 5차까지 P4-6 고착이 안 풀렸으니, Phase1 재시작마다 seed만 바꾸지 말고 priority_rule 자체를 바꿔서 이질적인 초기 해를 Phase 3에 넘기자. Area-descending / Area-Slack 혼합 규칙 요청. 대안(Phase3 대규모 파괴+MIP 재조립)은 이미 있는 wholebay 연산자와 동일 아이디어이고 그 연산자의 O(K²) MIP 구성 비용이 병목임을 확인, 이번엔 priority rule 쪽 먼저 진행.
+
+새 규칙 구현: "area"(면적 내림차순), "area_slack"(slack 오름차순 순위 + 면적 내림차순 순위의 순위합, 임의 가중치 없음). `analysis/priority_rule_compare.py`에 추가 + 별도 3자 비교 스크립트로 40개 인스턴스 재측정(15초/규칙).
+
+**결과**: EDD가 오늘 코드에서 오히려 더 강해짐(29/40, 33/40 두 비교 모두 -- 과거 21/40보다 우세, 오늘 고친 Phase1/3 개선들 때문으로 추정). area/area_slack은 6/40, 5/40 승이지만 질 때 10~838배 나쁨(파국적).
+
+`_PRIORITY_RULE_CYCLE = ["edd","edd","edd","area_slack","area"]`로 myalgorithm._iterated_greedy 수정 -- EDD 1~3번째 무조건, 4~5번째는 남는 예산 있을 때만 다양화. `_iterated_greedy`가 항상 "더 나은 것만 채택"이라 다양화 시도가 최종 결과를 나쁘게 할 수 없음(기회비용만).
+
+검증: x16/combined_3400 각 3회 전부 attempt 1(EDD)만 소진(대형 인스턴스는 재시작 1개뿐이라 영향 없음, 예상대로). prob_2에서 attempt 2가 새 순환표의 edd를 정확히 가져오는 것 확인. 40개 로버스트 40/40. `experiment/priority-rule-restart-cycle` -> main merge.
+
+**남은 큰 과제**: wholebay의 O(K²) MIP 구성 비용 스케일링(대규모 파괴 연산자의 진짜 병목), P1의 4→5차 악화 원인 재조사, Bottom-Left-Fill+sweep-line으로 MaxRects 교체(사용자 제안, 오늘 논의만 하고 미착수).
