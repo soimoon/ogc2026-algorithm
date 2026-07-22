@@ -253,6 +253,31 @@ def _candidate_positions(bay_w: float, bay_h: float,
     return candidates
 
 
+def _cached_bounding_rect(block: Block) -> tuple[float, float, float, float]:
+    """
+    Memoized block.bounding_rect(), attached directly to the Block instance.
+
+    2026-07-22 (user-proposed perf fix): profiling combined_stress_3400 (60s)
+    found bounding_rect()/_bounding_box() cost 13.4s (~22% of total runtime)
+    across 4.4M calls, the overwhelming majority from
+    _candidate_positions_maxrects2 rescanning the SAME already-placed blocks
+    from scratch on every call as it's invoked once per about-to-be-placed
+    block. Safe to cache because no code anywhere in this file mutates a
+    Block's x/y/orient_idx in place -- every move constructs a fresh Block
+    (verified by grep; also required by __post_init__'s own _layers_cache,
+    which already assumes x/y are fixed for the object's lifetime). Attached
+    as a plain instance attribute (not a utils.py change -- Block has no
+    __slots__, so this is legal from outside its defining module) rather
+    than an external dict keyed by id(block), which would risk a stale hit
+    if CPython reuses a garbage-collected block's address for a new one.
+    """
+    cached = getattr(block, "_bg_bbox_cache", None)
+    if cached is None:
+        cached = block.bounding_rect()
+        block._bg_bbox_cache = cached
+    return cached
+
+
 def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
                                    placed_blocks: list[Block],
                                    blk_bb: tuple[float, float, float, float],
@@ -295,7 +320,7 @@ def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
 
     free: list[tuple[float, float, float, float]] = [(0.0, 0.0, float(bay_w), float(bay_h))]
     for b in placed_blocks:
-        px0, py0, px1, py1 = b.bounding_rect()
+        px0, py0, px1, py1 = _cached_bounding_rect(b)
         new_free = []
         for (fx0, fy0, fx1, fy1) in free:
             if not (fx0 < px1 and px0 < fx1 and fy0 < py1 and py0 < fy1):
@@ -1627,11 +1652,12 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     print(f"[Greedy] {'-' * 56}")
     print(f"[Greedy] Phase 2 : repair  mode={repair_mode}")
     sol = {"operations": _build_operations(list(assignments.values()))}
-    assignments = _repair(prob_info, sol, assignments, bays, blocks_data,
-                          w1, w2, w3, t_start, timelimit,
-                          repair_mode=repair_mode, blocking_chain=blocking_chain,
-                          max_per_block=xpress_max_per_block,
-                          use_maxrects=use_maxrects)
+    assignments, repair_verified_result = _repair(
+        prob_info, sol, assignments, bays, blocks_data,
+        w1, w2, w3, t_start, timelimit,
+        repair_mode=repair_mode, blocking_chain=blocking_chain,
+        max_per_block=xpress_max_per_block,
+        use_maxrects=use_maxrects)
 
     # 2026-07-22 (user-proposed perf fix): tracks a check_feasibility result
     # that exactly matches the CURRENT `assignments` at every point below --
@@ -1643,20 +1669,26 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     # either a sweep committed (its OWN post-sweep check is then correct)
     # or it didn't (assignments reverted to the pre-sweep state, whose
     # pre-sweep check is then still correct -- _left_justify/_right_justify
-    # never mutate their input). None if left_justify and right_justify are
-    # both off, or (defensively) if _repair's own more complex exit paths
-    # make this unclear -- _improve falls back to its original from-scratch
-    # check whenever this is None, identical to before this parameter
-    # existed.
-    last_verified_result: dict | None = None
+    # never mutate their input). Seeded from _repair's own already-computed
+    # result (None if repair's final-guarantee force-place mutated
+    # assignments after its last check, or if it ended infeasible) --
+    # _improve falls back to its original from-scratch check whenever this
+    # is None, identical to before this parameter existed.
+    last_verified_result: dict | None = repair_verified_result
 
     # -- Phase 2.5: left-justify (pull blocks earlier where possible) ---------
     if left_justify:
         print(f"[Greedy] {'-' * 56}")
         print("[Greedy] Phase 2.5 : left-justify ...")
         from utils import check_feasibility as _cf_lj
-        pre_sol = {"operations": _build_operations(list(assignments.values()))}
-        pre_result = _cf_lj(prob_info, pre_sol)
+        # Reuse repair's own verified result instead of recomputing an
+        # identical check_feasibility call when it's available (see
+        # last_verified_result's seeding above).
+        if last_verified_result is not None:
+            pre_result = last_verified_result
+        else:
+            pre_sol = {"operations": _build_operations(list(assignments.values()))}
+            pre_result = _cf_lj(prob_info, pre_sol)
         if pre_result["feasible"]:
             justified, n_moved = _left_justify(
                 assignments, bays, blocks_data,
@@ -1688,8 +1720,17 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
         print(f"[Greedy] {'-' * 56}")
         print("[Greedy] Phase 2.6 : right-justify + re-left-justify ...")
         from utils import check_feasibility as _cf_rj
-        pre_rj_sol = {"operations": _build_operations(list(assignments.values()))}
-        pre_rj_result = _cf_rj(prob_info, pre_rj_sol)
+        # 2026-07-22 (user-proposed perf fix): last_verified_result already
+        # matches the current `assignments` exactly (see the invariant
+        # comment above, right before Phase 2.5) whenever Phase 2.5 ran --
+        # reuse it instead of paying for an identical check_feasibility call
+        # (measured ~2.2s at 3400-block scale). Only recompute when it's
+        # unavailable (left_justify=False, so Phase 2.5 never set it).
+        if last_verified_result is not None:
+            pre_rj_result = last_verified_result
+        else:
+            pre_rj_sol = {"operations": _build_operations(list(assignments.values()))}
+            pre_rj_result = _cf_rj(prob_info, pre_rj_sol)
         if pre_rj_result["feasible"]:
             rj_deadline = _justify_deadline(t_start, timelimit, 0.87)
             right_justified, n_moved_r = _right_justify(assignments, bays, blocks_data, deadline=rj_deadline)
@@ -4108,13 +4149,21 @@ def _repair(prob_info: dict,
             repair_mode: str = "greedy",
             blocking_chain: bool = True,
             max_per_block: int = 20,
-            use_maxrects: bool = False) -> dict[int, dict]:
+            use_maxrects: bool = False) -> tuple[dict[int, dict], dict | None]:
     """
     Iteratively detect infeasible blocks and repair them.
 
     Runs up to max_passes rounds of: check_feasibility -> collect violating
     block ids -> re-place them.  Stops early if the solution becomes feasible
     or 98% of timelimit is consumed.
+
+    Returns (assignments, verified_result). verified_result is the
+    check_feasibility dict that exactly matches the returned assignments --
+    reusable by the caller instead of recomputing an identical check
+    (2026-07-22, user-proposed perf fix) -- or None when it can't be trusted
+    to still match (the final-guarantee force-place block below mutates
+    assignments AFTER its own last check_feasibility call, so that call is
+    stale relative to what's actually returned).
 
     Blocking-chain aware (2026-07-20): violation messages from utils.py name
     not just the violating block but, for obstruction/collision violations,
@@ -4589,7 +4638,14 @@ def _repair(prob_info: dict,
               f"{(time.time() - t_start) / timelimit * 100:.0f}% of timelimit, not enough "
               f"margin left to safely attempt it without risking a TLE")
 
-    return assignments
+    # `result` still matches `assignments` exactly iff it was already
+    # feasible at the point it was computed above -- both branches that
+    # mutate `assignments` afterward (force-place) are gated on
+    # `not result["feasible"]`, so a feasible `result` here guarantees
+    # neither one ran. An infeasible result is never safe to forward (either
+    # it was mutated after, or the caller needs a fresh check regardless).
+    verified_result = result if result["feasible"] else None
+    return assignments, verified_result
 
 
 # -----------------------------------------------------------------------------
