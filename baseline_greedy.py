@@ -67,6 +67,7 @@ entry_time = int(t_str) for ENTRY ops; exit_time = int(t_str) for EXIT ops.
 Feasibility checking and objective computation: utils.check_feasibility(prob_info, solution).
 """
 
+import bisect
 import math
 import random
 import re
@@ -133,7 +134,9 @@ def _atc_priority(blk_data: dict, p_avg: float, k: float) -> float:
 
 def _candidate_positions(bay_w: float, bay_h: float,
                          placed_blocks: list[Block],
-                         blk_bb: tuple[float, float, float, float]) -> list[tuple[int, int]]:
+                         blk_bb: tuple[float, float, float, float],
+                         deadline: float | None = None,
+                         max_source_blocks: int | None = None) -> list[tuple[int, int]]:
     """
     Return integer (x, y) reference-point candidate positions for a new block
     using the "bottom-left fill" heuristic.
@@ -179,12 +182,55 @@ def _candidate_positions(bay_w: float, bay_h: float,
     addresses the diversity regression, the scattered-input performance
     cliff, AND actually speeds up the congested case that motivated this in
     the first place.
+
+    deadline : optional (2026-07-22, user-proposed). This function had NO
+        time awareness at all -- on a bay with thousands of placed blocks,
+        a single call's O(m^2) cross-product assembly loop below could run
+        for an unbounded amount of time with no way for a caller to
+        interrupt it, unlike every other hot loop in this codebase (which
+        all check some deadline periodically). Checked periodically (not
+        every single (x, y) pair, to keep the check's own overhead
+        negligible) during the O(|xs|*|ys|) assembly loop; if exceeded,
+        returns whatever candidates have been assembled so far instead of
+        continuing -- a partial, still-valid candidate list (every entry
+        already passed the bay-boundary check) beats blocking the caller
+        indefinitely. None (default) disables the check, identical to
+        before this parameter existed.
+    max_source_blocks : optional (2026-07-22, user-proposed). When set and
+        len(placed_blocks) exceeds it, only the top max_source_blocks
+        blocks BY FOOTPRINT AREA contribute their corner to the xs/ys sets
+        below -- the full cross-product structure (mixing ANY surviving
+        block's x with ANY surviving block's y) is preserved, only WHICH
+        blocks get to contribute a coordinate is restricted. This is
+        deliberately different from the reverted 2026-07-22 "per-block
+        corners only" attempt above (which only ever paired a block's OWN
+        x with its OWN y and lost genuine mixed-corner candidates between
+        UNRELATED blocks) -- large/major blocks are exactly the ones most
+        likely to actually define the bay's remaining free-space skyline;
+        a small block sitting well inside a large block's own footprint
+        rarely contributes a corner that survives the bay-boundary check
+        anyway. Same safety argument as every other candidate-count cap in
+        this codebase: every resulting (x, y) is still independently
+        re-verified downstream (bay.contains_block + _find_earliest_slot's
+        real feasibility check against the FULL, untruncated bay state,
+        not this subset) -- this can only miss some genuinely good
+        position (a quality cost, already accepted everywhere candidates
+        are capped), never accept an actually-infeasible one. None
+        (default) disables the filter, identical to before this parameter
+        existed.
     """
     lx0, ly0, lx1, ly1 = blk_bb
     # Smallest valid integer reference-point position (block's left/bottom edge at bay wall)
     xs = {max(0, math.ceil(-lx0))}
     ys = {max(0, math.ceil(-ly0))}
-    for b in placed_blocks:
+    source_blocks = placed_blocks
+    if max_source_blocks is not None and len(placed_blocks) > max_source_blocks:
+        source_blocks = sorted(
+            placed_blocks,
+            key=lambda b: (lambda r: (r[2] - r[0]) * (r[3] - r[1]))(b.bounding_rect()),
+            reverse=True,
+        )[:max_source_blocks]
+    for b in source_blocks:
         bb = b.bounding_rect()
         # Reference-point x/y such that new block's left/bottom edge touches the
         # right/top edge of this placed block
@@ -192,8 +238,16 @@ def _candidate_positions(bay_w: float, bay_h: float,
         ys.add(math.ceil(bb[3] - ly0))
 
     candidates = []
-    for x in sorted(xs):
-        for y in sorted(ys):
+    xs_sorted = sorted(xs)
+    ys_sorted = sorted(ys)
+    _check_every = 2000
+    _pairs_seen = 0
+    for x in xs_sorted:
+        for y in ys_sorted:
+            if deadline is not None:
+                _pairs_seen += 1
+                if _pairs_seen % _check_every == 0 and time.time() > deadline:
+                    return candidates
             if x + lx1 <= bay_w + 1e-6 and y + ly1 <= bay_h + 1e-6:
                 candidates.append((int(x), int(y)))
     return candidates
@@ -738,6 +792,39 @@ CANDIDATE_SCAN_CAP = 50
 # wait every time.
 OVERTIME_SCAN_CAP = 5
 
+# 2026-07-22 (bugfix, x16/4000-block stress test): OVERTIME_SCAN_CAP alone
+# does NOT bound overtime cost -- it only caps how many candidates get
+# SCANNED, not how many get GENERATED, and _candidate_positions /
+# _candidate_positions_maxrects2's generation cost scales with the size of
+# the bay's own active-block list regardless. On a large/congested instance
+# that list keeps growing throughout construction, so per-block overtime
+# cost visibly accelerated round after round (measured: 575s against a 60s
+# budget, ~9.6x over, on a 4000-block synthetic stress instance -- see
+# notes/algorithm_overview.md). Caps how many of the bay's own active blocks
+# get fed into candidate generation while in the overtime window, so that
+# cost stays bounded no matter how large the bay's full history has grown.
+OVERTIME_MAX_ACTIVE_BLOCKS = 60
+
+# 2026-07-22 (same bugfix): each orientation tried in the overtime window
+# still pays its own full _find_earliest_slot search against the bay's REAL,
+# untruncated schedule (OVERTIME_MAX_ACTIVE_BLOCKS only bounds candidate
+# GENERATION, not this) -- trying all n_orient (up to 8) orientations
+# multiplies that cost up to 8x per block. Capped separately since it's a
+# different cost source than active_in_bay's O(m^2) generation blowup.
+OVERTIME_MAX_ORIENTATIONS = 2
+
+# 2026-07-22 (user-proposed): cap on how many of a bay's placed blocks
+# contribute a corner to _candidate_positions' x/y sets when called from
+# _top_candidates_for_block (the xpress_reinsert-feeding path, which --
+# unlike _place_blocks's Phase 1 construction -- has no adaptive MaxRects
+# engine, since MaxRects was already found structurally unsuitable there
+# (see _candidate_positions' #47(b) note) -- so this path stays on the raw
+# O(m^2) cross product for any bay size. Reduces the effective m to a fixed
+# constant regardless of how large the bay's real population is -- see
+# _candidate_positions' max_source_blocks docstring for the safety argument
+# (downstream re-validation against the FULL bay state is unaffected).
+XPRESS_CANDIDATE_MAX_SOURCE_BLOCKS = 50
+
 def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
                               bay_placed: list[list[Block]],
                               bay_schedule: list[list[tuple[int, int]]],
@@ -834,7 +921,10 @@ def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
         for oi, _ in enumerate(blk_data["shape"]):
             scan_budget = CANDIDATE_SCAN_CAP
             blk_bb = _block_bbox(blk_data, oi)
-            candidates = _candidate_positions(bay.width, bay.height, placed_in_bay, blk_bb)
+            candidates = _candidate_positions(
+                bay.width, bay.height, placed_in_bay, blk_bb,
+                deadline=deadline, max_source_blocks=XPRESS_CANDIDATE_MAX_SOURCE_BLOCKS,
+            )
             if len(candidates) > scan_budget:
                 candidates = _rank_candidates_by_earliest_bound(
                     candidates, blk_bb, placed_in_bay, schedule_in_bay, r_time
@@ -978,7 +1068,8 @@ def _empty_bay_entry(schedule_in_bay: list[tuple[int, int]],
 def _aabb_gap_entry(new_bbox: tuple[float, float, float, float],
                     placed_in_bay: list[Block],
                     schedule_in_bay: list[tuple[int, int]],
-                    r_time: int, proc: int) -> int:
+                    r_time: int, proc: int,
+                    sorted_desc_cache: list[tuple[int, int, int, Block]] | None = None) -> int:
     """
     2026-07-22 (user-proposed): like _empty_bay_entry, but only requires the
     bay to be clear of blocks whose world AABB actually overlaps new_bbox --
@@ -993,27 +1084,61 @@ def _aabb_gap_entry(new_bbox: tuple[float, float, float, float],
     possibly obstruct check_entry/check_exit's same-or-higher-level test --
     and every AABB-DISJOINT block trivially can't obstruct it either,
     whether or not it's present. The only blocks that matter are exactly
-    the ones this function pushes entry past.
+    the ones this function pushes entry past, so the answer is simply
+    max(r_time, max(exit_time over every AABB-overlapping block)).
 
-    Same iterative-push algorithm as _empty_bay_entry, restricted to the
-    AABB-overlapping subset of schedule_in_bay (computed once -- new_bbox
-    is fixed for the whole call, exactly like _find_earliest_slot's spatial
-    pre-filter).
+    2026-07-22 bugfix (user-proposed): this used to be an iterative push
+    (repeatedly re-scanning relevant_schedule until [entry, entry+proc)
+    stopped TIME-overlapping any one of them) -- which can in principle
+    stop earlier than max(exit_time) when there's a genuine temporal gap
+    between clusters of overlapping-block occupancy, but still requires an
+    unconditional O(len(placed_in_bay)) scan (via _bb_overlap on every
+    block) to build relevant_schedule, on every single call, regardless of
+    result. On a large/congested instance this became the dominant cost:
+    _force_place calls accumulate through Phase 1's tail once
+    deadline/hard_deadline are exceeded, the bay they land in keeps
+    growing, and each subsequent call got slower -- measured directly, a
+    4000-block synthetic stress instance took 575s against a 60s budget
+    (9.6x over) with this exact per-call scan as the driver. Switched to
+    the simpler, single-pass "max exit_time over overlapping blocks"
+    definition (matches this function's OWN documented guarantee above --
+    "once every AABB-overlapping block has exited" -- literally), which is
+    still provably safe (can only be equal to or later than the tightest
+    possible entry, never earlier, so it never trades safety for speed) and
+    -- critically -- lets the caller supply candidates pre-sorted by
+    exit_time so the scan can stop at the FIRST match instead of touching
+    every block. Pure quality cost in the (probably rare) case where the
+    old iterative version found a tighter gap; never a safety regression.
+
+    sorted_desc_cache : optional. When given, must be a list of
+        (exit_time, entry_time, block_id, Block) tuples for this exact bay,
+        kept sorted ASCENDING by exit_time by the caller (_place_blocks
+        maintains this incrementally with bisect.insort, only once
+        genuinely past hard_deadline -- see that function -- since that's
+        the only point where no OTHER code path can still be adding
+        un-tracked blocks to the same bay for the rest of this call).
+        Scanned in reverse (highest exit_time first), so the first
+        AABB-matching entry found is guaranteed BY CONSTRUCTION to carry
+        the maximum exit_time among every AABB-overlapping block --
+        typically letting this return after checking only a handful of
+        blocks instead of every one in the bay. None (default) falls back
+        to the plain O(placed_in_bay) scan -- both branches compute the
+        exact same quantity, this parameter only changes HOW it's found.
     """
-    relevant_schedule = [
-        (a, e) for b, (a, e) in zip(placed_in_bay, schedule_in_bay)
-        if _bb_overlap(new_bbox, b.bounding_rect())
-    ]
-    entry = int(r_time)
-    changed = True
-    while changed:
-        changed = False
-        exit_t = entry + proc
-        for a, e in relevant_schedule:
-            if _time_overlaps(entry, exit_t, a, e):
-                entry = max(entry, e)
-                changed = True
-    return entry
+    if sorted_desc_cache is not None:
+        best_e = None
+        for e, _a, _bid, b in reversed(sorted_desc_cache):
+            if _bb_overlap(new_bbox, b.bounding_rect()):
+                best_e = e
+                break  # exit_time-ascending list, scanned in reverse -> first hit is the max
+        return max(int(r_time), best_e) if best_e is not None else int(r_time)
+
+    best_e = None
+    for b, (_a, e) in zip(placed_in_bay, schedule_in_bay):
+        if _bb_overlap(new_bbox, b.bounding_rect()):
+            if best_e is None or e > best_e:
+                best_e = e
+    return max(int(r_time), best_e) if best_e is not None else int(r_time)
 
 
 # -----------------------------------------------------------------------------
@@ -1235,16 +1360,22 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                     constant, not tuned/selected by which value scores best
                     on the local train instances (that would just be
                     overfitting a hyperparameter to local data).
-    construction_mode : "batched" (default, added 2026-07-20) -- Phase 1
-                    commits blocks in batches of PHASE1_BATCH_SIZE via
-                    xpress_reinsert.reinsert() (jointly optimized), falling
-                    back to the classic one-at-a-time _place_blocks per
-                    batch if Xpress is unavailable/fails/finds nothing.
-                    "serial" -- the original Serial-SGS behaviour (one block
-                    at a time, never revisited). Kept switchable so a
-                    regression can be ruled out/rolled back with a single
-                    flag flip; see _place_blocks_batched's docstring for the
-                    motivation (Serial SGS commits blocks with no visibility
+    construction_mode : "serial" (default) -- the original Serial-SGS
+                    behaviour (one block at a time, never revisited).
+                    "batched" -- Phase 1 commits blocks in batches of
+                    PHASE1_BATCH_SIZE via xpress_reinsert.reinsert() (jointly
+                    optimized), falling back to the classic one-at-a-time
+                    _place_blocks per batch if Xpress is unavailable/fails/
+                    finds nothing. 2026-07-20 bugfix: this docstring used to
+                    claim "batched" was the default -- it never was in the
+                    actual signature, and batched was separately confirmed
+                    (500/1000-block stress tests) to lose to serial by up to
+                    647x, so it's kept only as an explicit opt-in for
+                    regression comparison, never something a caller should
+                    reach for by default. Kept switchable so a regression can
+                    be ruled out/rolled back with a single flag flip; see
+                    _place_blocks_batched's docstring for the motivation
+                    (Serial SGS commits blocks with no visibility
                     into blocks not yet placed, which is a structural cause
                     of Phase 2/_repair ever being needed at all).
 
@@ -1502,6 +1633,23 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                           max_per_block=xpress_max_per_block,
                           use_maxrects=use_maxrects)
 
+    # 2026-07-22 (user-proposed perf fix): tracks a check_feasibility result
+    # that exactly matches the CURRENT `assignments` at every point below --
+    # not an incremental diff (there's no partial change to reconcile here),
+    # just avoiding letting an already-computed result go to waste. Updated
+    # immediately after every check_feasibility call in this stretch, before
+    # any commit-or-discard decision that might change `assignments` again,
+    # so the invariant "matches current assignments exactly" always holds:
+    # either a sweep committed (its OWN post-sweep check is then correct)
+    # or it didn't (assignments reverted to the pre-sweep state, whose
+    # pre-sweep check is then still correct -- _left_justify/_right_justify
+    # never mutate their input). None if left_justify and right_justify are
+    # both off, or (defensively) if _repair's own more complex exit paths
+    # make this unclear -- _improve falls back to its original from-scratch
+    # check whenever this is None, identical to before this parameter
+    # existed.
+    last_verified_result: dict | None = None
+
     # -- Phase 2.5: left-justify (pull blocks earlier where possible) ---------
     if left_justify:
         print(f"[Greedy] {'-' * 56}")
@@ -1511,21 +1659,25 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
         pre_result = _cf_lj(prob_info, pre_sol)
         if pre_result["feasible"]:
             justified, n_moved = _left_justify(
-                assignments, bays, blocks_data, deadline=t_start + timelimit * 0.85,
+                assignments, bays, blocks_data,
+                deadline=_justify_deadline(t_start, timelimit, 0.85),
             )
             justified_sol = {"operations": _build_operations(list(justified.values()))}
             justified_result = _cf_lj(prob_info, justified_sol)
             if justified_result["feasible"] and justified_result["objective"] <= pre_result["objective"] + 1e-6:
                 gain = pre_result["objective"] - justified_result["objective"]
                 assignments = justified
+                last_verified_result = justified_result
                 print(f"[Greedy] Left-justify: moved {n_moved} block(s)  "
                       f"obj {pre_result['objective']:.0f} -> {justified_result['objective']:.0f} "
                       f"(-{gain:.0f})")
             else:
+                last_verified_result = pre_result
                 print(f"[Greedy] Left-justify: swept result not better/feasible "
                       f"(feasible={justified_result['feasible']}), keeping pre-sweep state "
                       f"({n_moved} candidate move(s) discarded)")
         else:
+            last_verified_result = pre_result
             print("[Greedy] Left-justify: skipped (pre-sweep state not feasible)")
 
     # -- Phase 2.6: right-justify then re-left-justify (escape local optima) --
@@ -1539,7 +1691,7 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
         pre_rj_sol = {"operations": _build_operations(list(assignments.values()))}
         pre_rj_result = _cf_rj(prob_info, pre_rj_sol)
         if pre_rj_result["feasible"]:
-            rj_deadline = t_start + timelimit * 0.87
+            rj_deadline = _justify_deadline(t_start, timelimit, 0.87)
             right_justified, n_moved_r = _right_justify(assignments, bays, blocks_data, deadline=rj_deadline)
             re_left_justified, n_moved_l = _left_justify(right_justified, bays, blocks_data, deadline=rj_deadline)
             rj_sol = {"operations": _build_operations(list(re_left_justified.values()))}
@@ -1547,14 +1699,17 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
             if rj_result["feasible"] and rj_result["objective"] <= pre_rj_result["objective"] + 1e-6:
                 gain = pre_rj_result["objective"] - rj_result["objective"]
                 assignments = re_left_justified
+                last_verified_result = rj_result
                 print(f"[Greedy] Right-justify+re-left: moved {n_moved_r}+{n_moved_l} block(s)  "
                       f"obj {pre_rj_result['objective']:.0f} -> {rj_result['objective']:.0f} "
                       f"(-{gain:.0f})")
             else:
+                last_verified_result = pre_rj_result
                 print(f"[Greedy] Right-justify+re-left: swept result not better/feasible "
                       f"(feasible={rj_result['feasible']}), keeping pre-sweep state "
                       f"({n_moved_r}+{n_moved_l} candidate move(s) discarded)")
         else:
+            last_verified_result = pre_rj_result
             print("[Greedy] Right-justify+re-left: skipped (pre-sweep state not feasible)")
 
     # -- Phase 3: improve feasible-but-tardy assignments with leftover time ---
@@ -1565,7 +1720,7 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                            annealing=annealing, z2z3_modes=z2z3_modes, seed=seed,
                            max_per_block=xpress_max_per_block,
                            z1_lower_bound=z1_lower_bound, z23_relax=z23_relax,
-                           use_maxrects=use_maxrects)
+                           use_maxrects=use_maxrects, known_result=last_verified_result)
 
     elapsed_total = time.time() - t_start
     final_sol = {"operations": _build_operations(list(assignments.values()))}
@@ -1597,11 +1752,25 @@ def _force_place(bi: int,
                  bays: list[Bay],
                  bay_placed: list[list[Block]],
                  bay_schedule: list[list[tuple[int, int]]],
-                 prefs: list[float]) -> tuple:
+                 prefs: list[float],
+                 sorted_cache: dict[int, list[tuple[int, int, int, Block]]] | None = None) -> tuple:
     """
     Fallback placement: place block bi at the minimum valid position in the
     highest-preference bay whose dimensions accommodate the block, using
     the earliest AABB-clear entry window at that position.
+
+    sorted_cache : optional (2026-07-22 perf fix). Mutable dict[bay_id ->
+        list of (exit_time, entry_time, block_id, Block) tuples sorted
+        ascending by exit_time], maintained by the caller across a whole
+        burst of force-place calls -- see _place_blocks and
+        _aabb_gap_entry's docstrings. Only ever passed non-None once the
+        caller has established no OTHER code path can still be adding
+        untracked blocks to any bay for the rest of this call (i.e. truly
+        past hard_deadline), since this function inserts bi into it after
+        placing, and a stale/incomplete cache would be a real safety bug,
+        not just a quality one. None (default) -- no cache, falls back to
+        _aabb_gap_entry's plain per-call scan, identical to before this
+        parameter existed.
 
     When called:
       * _place_blocks found no feasible (position, bay, time-slot) combination
@@ -1674,10 +1843,30 @@ def _force_place(bi: int,
             px = max(0, px_lo)
             py = max(0, py_lo)
             new_bbox = (px + lx0, py + ly0, px + lx1, py + ly1)
+            bay_cache = None
+            if sorted_cache is not None:
+                bay_cache = sorted_cache.get(bay_id)
+                if bay_cache is None:
+                    # Lazy first build for this bay (one-time O(n log n)) --
+                    # captures everything already committed to it so far,
+                    # whether placed via search or a previous force-place.
+                    bay_cache = sorted(
+                        (
+                            (e, a, b.block_id, b)
+                            for b, (a, e) in zip(bay_placed[bay_id], bay_schedule[bay_id])
+                        ),
+                        key=lambda t: t[0],
+                    )
+                    sorted_cache[bay_id] = bay_cache
             entry = _aabb_gap_entry(
-                new_bbox, bay_placed[bay_id], bay_schedule[bay_id], r_time, proc
+                new_bbox, bay_placed[bay_id], bay_schedule[bay_id], r_time, proc,
+                sorted_desc_cache=bay_cache,
             )
-            return (bay_id, px, py, oi, entry, entry + proc)
+            exit_t = entry + proc
+            if sorted_cache is not None:
+                new_blk = Block(block_id=bi, block_data=blk_data, x=px, y=py, orient_idx=oi)
+                bisect.insort(bay_cache, (exit_t, entry, bi, new_blk), key=lambda t: t[0])
+            return (bay_id, px, py, oi, entry, exit_t)
 
     # This path should never be reached: greedyalgorithm() checks at startup that
     # every block has at least one valid integer position and raises ValueError for
@@ -1849,6 +2038,18 @@ def _place_blocks(
     # the underlying per-candidate cost instead of reallocating time around
     # it).
 
+    # 2026-07-22 (user-proposed perf fix): lazily-built, incrementally
+    # maintained per-bay cache for _force_place's _aabb_gap_entry lookup
+    # (see that function's docstring) -- keyed by bay_id, only ever read/
+    # written once `past_hard_deadline` is True for the current rank (see
+    # the call site below), since that's the one point in this function
+    # where NO other code path can still be adding untracked blocks to any
+    # bay for the rest of this call (every remaining rank is unconditionally
+    # forced too). A stale cache used outside that guarantee would be a
+    # real safety bug, not just a quality one -- see _force_place's
+    # sorted_cache docstring.
+    _force_place_sorted_cache: dict[int, list[tuple[int, int, int, Block]]] = {}
+
     for rank, bi in enumerate(block_ids):
         blk_data = blocks_data[bi]
         r_time   = blk_data["release_time"]
@@ -1969,6 +2170,29 @@ def _place_blocks(
                     b for b, (a_k, e_k) in zip(placed_in_bay, schedule_in_bay)
                     if e_k > r_time
                 ]
+                # 2026-07-22 bugfix (user-caught, x16/4000-block stress test):
+                # OVERTIME_SCAN_CAP + single-bay restriction only bounds how
+                # many candidates get PICKED, not how many get GENERATED --
+                # _candidate_positions / _candidate_positions_maxrects2's own
+                # cost scales with len(active_in_bay) regardless of
+                # scan_budget. On a large/congested instance, active_in_bay
+                # for the (usually few) most-contested bay(s) keeps growing
+                # throughout construction, so each subsequent overtime call
+                # got progressively more expensive -- a self-reinforcing
+                # spiral (confirmed directly: a 4000-block stress instance
+                # took 575s against a 60s budget, ~9.6x over, with per-block
+                # overtime cost visibly accelerating in the log). Cap the
+                # bay-state INPUT itself here so overtime cost stays bounded
+                # no matter how large this bay's full history has grown.
+                # Safe: downstream _find_earliest_slot / bay.contains_block
+                # always check the trial position against the FULL
+                # placed_in_bay/schedule_in_bay (passed separately, untouched
+                # by this truncation) -- this can only miss some genuinely
+                # free spot (a quality cost, already accepted everywhere else
+                # candidates are capped in this codebase), never accept an
+                # actually-occupied position.
+                if in_overtime and len(active_in_bay) > OVERTIME_MAX_ACTIVE_BLOCKS:
+                    active_in_bay = active_in_bay[-OVERTIME_MAX_ACTIVE_BLOCKS:]
                 if use_maxrects:
                     # 2026-07-22 (user-proposed): feed MaxRects's
                     # from-scratch replay largest-block-first. The final
@@ -1991,7 +2215,22 @@ def _place_blocks(
                         return (r[2] - r[0]) * (r[3] - r[1])
                     active_in_bay = sorted(active_in_bay, key=_block_area, reverse=True)
 
-                for oi in range(n_orient):
+                # 2026-07-22 bugfix: capping active_in_bay above bounds
+                # candidate-GENERATION cost, but each orientation still pays
+                # its own full _find_earliest_slot search against this bay's
+                # REAL (untruncated) placed_in_bay/schedule_in_bay -- trying
+                # all n_orient (up to 8) orientations in overtime mode still
+                # multiplies that cost up to 8x per block. Measured directly:
+                # even with the active_in_bay cap alone, a 2000-block stress
+                # instance still overran its budget 1.4x (84s/60s), with
+                # Phase 1 alone taking more than double its intended
+                # hard_deadline share. Also cap orientations tried while in
+                # overtime -- the first candidate found across ANY
+                # orientation is still compared by score like normal, this
+                # just stops trying ALL of them once time is already this
+                # tight.
+                orient_range = range(min(n_orient, OVERTIME_MAX_ORIENTATIONS)) if in_overtime else range(n_orient)
+                for oi in orient_range:
                     if deadline_hit:
                         break
                     scan_budget = OVERTIME_SCAN_CAP if in_overtime else CANDIDATE_SCAN_CAP
@@ -2070,7 +2309,10 @@ def _place_blocks(
                             best_placement = (bay_id, cx, cy, oi, entry, exit_t)
 
         if best_placement is None:
-            best_placement = _force_place(bi, blocks_data, bays, bay_placed, bay_schedule, prefs)
+            best_placement = _force_place(
+                bi, blocks_data, bays, bay_placed, bay_schedule, prefs,
+                sorted_cache=_force_place_sorted_cache if past_hard_deadline else None,
+            )
             n_fallback += 1
 
         if used_forced:
@@ -2308,6 +2550,26 @@ def _try_rebalance_move(
     xpress_reinsert.reinsert()'s None contract). Does not mutate
     bay_placed/bay_schedule -- the caller commits on accept, same as every
     other reinsertion path in this module.
+
+    2026-07-22 bugfix (user-caught): this called _candidate_positions with
+    no deadline and no max_source_blocks cap, and evaluated EVERY resulting
+    candidate via _find_earliest_slot with no scan budget at all -- the
+    same unbounded-cost pattern already found and fixed today in
+    _place_blocks, _force_place, and _top_candidates_for_block, just missed
+    here. target_bay_id is chosen as the lightest bay by WEIGHTED load
+    (bay_weights[j] * bay_loads[j]) -- a large bay can have a low weighted
+    load while still holding a large raw block count, so "lightest" here
+    does not imply "small enough to scan freely". Measured directly: one
+    "balance" round on a 1000-block synthetic stress instance took ~118s
+    (vs ~1s for a typical xpress_reinsert round on the same instance) with
+    this exact call as the only unbounded step. Now capped the same way as
+    _top_candidates_for_block: max_source_blocks limits candidate
+    GENERATION cost, CANDIDATE_SCAN_CAP + periodic deadline checks limit
+    how many candidates get the full _find_earliest_slot treatment. Same
+    safety argument as every other cap in this module -- downstream
+    bay.contains_block / _find_earliest_slot still re-verify against the
+    FULL local_placed/local_schedule, so this can only miss a genuinely
+    better slot, never accept an infeasible one.
     """
     bay = bays[target_bay_id]
     local_placed = list(bay_placed[target_bay_id])
@@ -2325,12 +2587,28 @@ def _try_rebalance_move(
 
         best = None
         for oi in range(len(blk_data["shape"])):
+            if deadline is not None and time.time() > deadline:
+                return None
             blk_bb = _block_bbox(blk_data, oi)
             lx0, ly0, lx1, ly1 = blk_bb
             if (math.ceil(-lx0) > math.floor(bay.width - lx1) or
                     math.ceil(-ly0) > math.floor(bay.height - ly1)):
                 continue
-            for cx, cy in _candidate_positions(bay.width, bay.height, local_placed, blk_bb):
+            candidates = _candidate_positions(
+                bay.width, bay.height, local_placed, blk_bb,
+                deadline=deadline, max_source_blocks=XPRESS_CANDIDATE_MAX_SOURCE_BLOCKS,
+            )
+            if len(candidates) > CANDIDATE_SCAN_CAP:
+                candidates = _rank_candidates_by_earliest_bound(
+                    candidates, blk_bb, local_placed, local_schedule, r_time
+                )
+            scan_budget = CANDIDATE_SCAN_CAP
+            for cx, cy in candidates:
+                if scan_budget <= 0:
+                    break
+                scan_budget -= 1
+                if deadline is not None and time.time() > deadline:
+                    return None
                 new_blk = Block(block_id=bi, block_data=blk_data, x=cx, y=cy, orient_idx=oi)
                 if not bay.contains_block(new_blk):
                     continue
@@ -2890,7 +3168,8 @@ def _improve(prob_info: dict,
             max_per_block: int = 20,
             z1_lower_bound: float = 0.0,
             z23_relax: bool = True,
-            use_maxrects: bool = False) -> dict[int, dict]:
+            use_maxrects: bool = False,
+            known_result: dict | None = None) -> dict[int, dict]:
     """
     Large-neighborhood-search-style improvement pass for an already FEASIBLE
     solution, targeting all three objective components (not just Z1).
@@ -2966,6 +3245,24 @@ def _improve(prob_info: dict,
     wall-clock budget just because rounds got cheaper. Early return here
     isn't wasted either way: myalgorithm._iterated_greedy can spend
     whatever's left on a fresh restart with a different seed.
+
+    known_result : optional (2026-07-22 perf fix, user-proposed). A
+        check_feasibility result the caller already computed for THIS EXACT
+        `assignments` (e.g. whichever of left-justify/right-justify's own
+        pre-sweep or post-sweep checks was the last one performed, since
+        neither function mutates its input and a commit only ever happens
+        right after its own confirming check -- see greedyalgorithm's
+        `last_verified_result` tracking). Measured directly: this function's
+        own from-scratch re-check of the same state took ~19s on a
+        4000-block synthetic stress instance, consuming the ENTIRE Phase 3
+        budget before a single round could run. When given, used in place
+        of a redundant recomputation; when None (default, e.g. both
+        left_justify and right_justify are off), falls back to computing it
+        fresh here exactly as before this parameter existed. Not an
+        incremental/diffed result like check_feasibility_incremental --
+        there's no partial change to reconcile, `assignments` genuinely
+        hasn't moved since known_result was computed, so this is just reuse,
+        not a new correctness-sensitive mechanism.
     """
     from utils import check_feasibility
 
@@ -2985,7 +3282,7 @@ def _improve(prob_info: dict,
     def _build(a: dict[int, dict]) -> dict:
         return {"operations": _build_operations(list(a.values()))}
 
-    base_result = check_feasibility(prob_info, _build(assignments))
+    base_result = known_result if known_result is not None else check_feasibility(prob_info, _build(assignments))
     if not base_result["feasible"]:
         print("[Greedy] Improve: skipped (incoming solution is not feasible)")
         return assignments
@@ -3524,6 +3821,41 @@ def _improve(prob_info: dict,
 # Phase 2.5: left-justify (RCPSP-style schedule compaction)
 # -----------------------------------------------------------------------------
 
+# 2026-07-22 bugfix (user-caught): _left_justify/_right_justify's deadline
+# parameter used to be a fixed FRACTION OF THE TOTAL TIMELIMIT measured from
+# t_start (e.g. t_start + timelimit*0.85) -- fine when every earlier phase
+# uses close to its own worst-case share, but if Phase 2 (repair) converges
+# early (as it did in a 1000-block synthetic stress test: repair finished
+# in 26.8s against an 80%-of-180s=144s allowance), left-justify silently
+# INHERITS all of that unused slack, since its deadline is still anchored to
+# t_start, not to "how much is actually left right now". Measured directly:
+# left-justify + right-justify together consumed ~116s of that leftover
+# slack on a single congested bay, starving Phase 3 of nearly the entire
+# budget it was supposed to get. Fix: give these two passes their OWN small
+# budget computed from `time.time()` at the moment they're ABOUT TO START
+# (not from t_start), so it can never balloon just because an earlier phase
+# happened to finish ahead of schedule -- capped at whichever is smaller of
+# a fraction of whatever's ACTUALLY left, or a small absolute ceiling.
+JUSTIFY_MAX_FRAC_OF_REMAINING = 0.05
+JUSTIFY_ABS_CAP_SECONDS = 10.0
+
+
+def _justify_deadline(t_start: float, timelimit: float, outer_frac: float) -> float:
+    """
+    Compute a tight, "now"-anchored deadline for one left/right-justify call:
+    never later than the existing outer_frac-of-timelimit cap (preserves the
+    original safety ceiling exactly), AND never more than
+    min(JUSTIFY_ABS_CAP_SECONDS, JUSTIFY_MAX_FRAC_OF_REMAINING * whatever's
+    actually left right now) beyond the current moment -- see the module
+    comment above for why anchoring to t_start alone let an early-finishing
+    earlier phase's slack silently balloon this one's real budget.
+    """
+    now = time.time()
+    remaining = max(0.0, (t_start + timelimit) - now)
+    own_budget = min(JUSTIFY_ABS_CAP_SECONDS, remaining * JUSTIFY_MAX_FRAC_OF_REMAINING)
+    return min(t_start + timelimit * outer_frac, now + own_budget)
+
+
 def _left_justify(
     assignments: dict[int, dict],
     bays: list[Bay],
@@ -3782,11 +4114,18 @@ def _repair(prob_info: dict,
     forced_ids:      set[int]       = set()
 
     for pass_idx in range(max_passes):
-        # Capped at 80% (not 98%) so Phase 3 (_improve) is structurally
-        # guaranteed a real slice of the budget instead of only getting
-        # whatever repair happens not to use -- repair already exits early
-        # via the feasible-break below whenever it converges sooner anyway.
-        if time.time() - t_start > timelimit * 0.80:
+        # Capped at 78% (not 80%, not 98%) so Phase 3 (_improve) is
+        # structurally guaranteed a real slice of the budget instead of only
+        # getting whatever repair happens not to use -- repair already exits
+        # early via the feasible-break below whenever it converges sooner
+        # anyway. 2026-07-22 (user-proposed): tightened from 80% to 78%,
+        # deliberately leaving the individual pass attempts below (which
+        # still target 80% for their own internal deadlines) a small,
+        # GUARANTEED 2%-of-timelimit reserve that this loop itself will never
+        # spend -- reserved specifically for the final feasibility-guarantee
+        # step after this loop (see below), so that step doesn't have to
+        # compete with an in-progress pass for whatever time is left.
+        if time.time() - t_start > timelimit * 0.78:
             break
 
         result = check_feasibility(prob_info, sol)
@@ -4109,6 +4448,79 @@ def _repair(prob_info: dict,
     forced_note = f"  forced={len(forced_ids)}" if forced_ids else ""
     elapsed_done = time.time() - t_start
     print(f"[Greedy] Repair done  |  {status}  {obj}{forced_note}  elapsed={elapsed_done:.1f}s")
+
+    # -- Final feasibility guarantee (2026-07-22, user-proposed) --------------
+    # The loop above can exit (78% time cap or max_passes exhausted) with
+    # SOME violations still unresolved -- returning that state risks the
+    # caller (myalgorithm._iterated_greedy) discarding it as infeasible and,
+    # if no time remains for another restart, falling all the way back to
+    # _emergency_fallback -- a MUCH lower quality floor than whatever real
+    # repair progress was made here. _force_place is provably crane-safe
+    # regardless of shape/position (see its docstring), so force-place every
+    # still-violating block, guaranteeing feasibility here unconditionally
+    # instead of leaving it to chance.
+    #
+    # Time budget: the loop above was tightened from 80% to 78% specifically
+    # to leave this step a GUARANTEED, uncontested 2%-of-timelimit reserve
+    # (see that change's comment). `result` above is already a FRESH,
+    # authoritative check against the current `sol` -- reused here, not
+    # recomputed, so this costs nothing extra to find out what's still
+    # broken. Does NOT re-verify with a second check_feasibility call after
+    # force-placing (that would cost as much as `result` itself already did
+    # -- possibly ~19s on a very large instance, measured directly -- for a
+    # confirmation Phase 2.5/2.6/3's own upcoming checks will give for free
+    # moments later anyway). Skips the attempt entirely if already past 95%
+    # of timelimit -- at that point there may not even be room for the
+    # force-place loop itself, and attempting it risks CAUSING a TLE instead
+    # of preventing an infeasible return, which would be strictly worse.
+    if not result["feasible"] and time.time() - t_start < timelimit * 0.95:
+        final_viol_ids: list[int] = []
+        seen_final: set[int] = set()
+        for v in result["violations"]:
+            for x in re.findall(r"block (\d+)", v):
+                bid = int(x)
+                if bid not in seen_final:
+                    seen_final.add(bid)
+                    final_viol_ids.append(bid)
+        print(f"[Greedy] Repair: final guarantee -- force-placing {len(final_viol_ids)} "
+              f"still-violating block(s) to avoid returning infeasible")
+        # "뽑아내고 밀어넣기" (extract-then-insert, user-specified): remove
+        # every violator from assignments FIRST, so none of them can
+        # phantom-collide with its own stale position, then rebuild a clean
+        # bay state from what's left (mirrors the main loop's own
+        # greedy-mode pattern above).
+        for bid in final_viol_ids:
+            assignments.pop(bid, None)
+        bay_placed_f, bay_schedule_f, bay_loads_f = _rebuild_bay_state(
+            assignments, bays, blocks_data
+        )
+        # Sequential, one at a time (user-specified): _aabb_gap_entry
+        # computes each block's entry window against the bay state passed to
+        # it -- placing several blocks against the SAME snapshot would let
+        # them all land in the same "empty" slot and collide with EACH
+        # OTHER. Commit each one (update bay_placed_f/bay_schedule_f/
+        # bay_loads_f) before computing the next.
+        for bid in final_viol_ids:
+            bay_id, px, py, oi, entry, exit_t = _force_place(
+                bid, blocks_data, bays, bay_placed_f, bay_schedule_f,
+                blocks_data[bid]["bay_preferences"],
+            )
+            new_blk = Block(block_id=bid, block_data=blocks_data[bid], x=px, y=py, orient_idx=oi)
+            bay_placed_f[bay_id].append(new_blk)
+            bay_schedule_f[bay_id].append((entry, exit_t))
+            bay_loads_f[bay_id] += blocks_data[bid]["workload"]
+            assignments[bid] = {
+                "block_id": bid, "bay_id": bay_id,
+                "x": int(px), "y": int(py), "orient_idx": oi,
+                "entry_time": int(entry), "exit_time": int(exit_t),
+            }
+        print(f"[Greedy] Repair: final guarantee applied to {len(final_viol_ids)} block(s) "
+              f"(not re-verified here -- see comment above; Phase 2.5/2.6/3's own upcoming "
+              f"checks will confirm)")
+    elif not result["feasible"]:
+        print(f"[Greedy] Repair: final guarantee SKIPPED -- already at "
+              f"{(time.time() - t_start) / timelimit * 100:.0f}% of timelimit, not enough "
+              f"margin left to safely attempt it without risking a TLE")
 
     return assignments
 
