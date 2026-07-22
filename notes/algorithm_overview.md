@@ -377,6 +377,13 @@
     **검증**: combined_stress_3400 재프로파일링 -> `bounding_rect` 호출 304만->30.6만(~90% 감소), 상위 30위 밖으로 밀려남. x16/combined_3400 각 3회 반복 -> 전부 feasible, combined_3400 objective가 이전(143.7억~149.9억) 대비 124억~128억으로 개선(절약된 시간이 Phase 3에 재투자된 것으로 추정). 40개 로컬 인스턴스 20초 로버스트 -> 40/40 feasible, 0 크래시. `experiment/global-bbox-cache` 브랜치에서 main으로 merge.
     **남은 최대 병목 (미해결, 성격이 다름)**: `_candidate_positions_maxrects2`(MaxRects 후보생성) 자체가 매 호출마다 `placed_blocks` 전체를 처음부터 재생하며 O(m x freelist^2) sliver-pruning/containment dedup을 수행 -- 이건 캐싱으로 없앨 수 있는 "이미 아는 답 재계산"이 아니라, 매 호출이 실제로 다른 입력(다른 블록)에 대한 진짜 새 계산이라 발생하는 **알고리즘 자체의 복잡도**. 코드 내 `min_width`/`min_height` 파라미터 주석에 이미 진짜 해법(free-rect 리스트를 호출 간 persistent하게 유지)이 언급돼 있으나, sliver-pruning 임계값을 "이번 호출 블록 크기" 대신 "앞으로 올 수 있는 모든 블록의 전역 최솟값"으로 바꿔야 하는 정확성 문제가 있어 미룬 상태. 오늘 고친 것들보다 범위가 크고 리스크가 높은 별도 프로젝트로 남겨둠.
 
+67. **MaxRects 후보생성을 블록 간이 아닌 orientation 간 공유로 범위 축소 (사용자 제안 -> 설계 중 위험 발견 -> 축소, 2026-07-22)**
+    #66의 "남은 최대 병목"을 이어서, 원래 계획대로 free-rect 리스트를 **블록 간(호출 간) persistent**하게 만들려 했으나 설계 도중 정확성 문제를 발견: `active_in_bay`는 `e_k > r_time` 필터링(퇴장한 블록은 공간이 다시 빈다)을 거치고, `_place_blocks`는 블록을 EDD(마감일) 순서로 처리하지 release_time 순서가 아니라서, "활성" 블록 집합이 호출마다 비단조적으로 바뀜 -- 단순 persistent 캐시는 이미 나간 블록의 옛 자리를 여전히 점유 중이라고 착각할 위험이 있음(진짜 해법은 구간트리 같은 시공간 자료구조가 필요, 훨씬 크고 위험한 별도 프로젝트).
+    **범위 축소**: 대신 **같은 블록의 여러 orientation 간 공유**로 좁힘 -- 한 블록의 모든 orientation은 `active_in_bay`/`r_time` 컨텍스트가 완전히 동일하고, 다른 건 그 orientation 자신의 (bw, bh)뿐이라 시간 문제가 전혀 없음. `_candidate_positions_maxrects2`를 `_maxrects_free_space`(split+prune, sliver 임계값을 인자로 받음)와 `_maxrects_extract_candidates`(orientation별 최종 크기-맞음 체크)로 분리하고, `_place_blocks`가 bay당 한 번만 `_maxrects_free_space`를 (이미 계산되어 있던 전역 최솟값 `maxrects_min_width`/`maxrects_min_height`를 sliver 임계값으로) 호출한 뒤, orientation 루프 안에서는 값싼 `_maxrects_extract_candidates`만 반복.
+    **동등성 검증**: 전역 최솟값 임계값은 항상 이번 블록의 실제 (bw,bh)보다 작거나 같아서 조각을 "덜 버리기만" 하고, 최종 크기 체크가 orientation별로 따로 걸리므로 결과 후보 집합이 이론상 완전히 동일해야 함 -- 별도 스크립트로 2개 시나리오(수동 배치 + 25개 랜덤 배치) x 여러 orientation 조합에서 기존 방식과 신규 방식의 후보 집합을 직접 비교, **불일치 0건** 확인 후 진행.
+    **실측 결과 (솔직히 기대보다 애매함)**: `_maxrects_free_space` 호출 수는 32,618 -> 4,164(약 8배 감소, orientation 수만큼 줄어든 설계대로)이나, 전역 최솟값이 orientation별 자기 기준보다 훨씬 보수적이라 매 호출이 더 많은 조각을 안 버리고 남겨서 **호출당 O(freelist^2) pruning 비용이 커짐** -- 순 효과가 이번 프로파일링 샘플에서는 뚜렷하지 않음(전체 wall-clock이 이전과 비슷한 50s대). 호출 수는 확실히 줄었지만 그게 총비용 감소로 깨끗이 이어지진 않은 사례.
+    **검증**: x16/combined_3400 각 3회 -> 전부 feasible, objective는 #66과 동등 수준(회귀 없음). 40개 로컬 로버스트 -> 40/40 feasible, 0 크래시. `experiment/maxrects-orientation-share` -> main merge (안전성은 확실히 검증됐고 회귀는 없으나, 순이익은 불확실 -- 다음에 재확인 필요).
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
