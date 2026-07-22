@@ -207,3 +207,15 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 **검증**: x16/combined_stress_3400 각 3회 -> 전부 feasible, elapsed가 이전(60s 예산에서 63~64s로 초과하던 수준)보다 뚜렷이 개선되어 51~55s대로 예산 안에 안전하게 들어옴, objective는 동등 수준. 40개 로컬 로버스트 40/40. `experiment/measured-safety-margin` -> main merge.
 
 이걸로 사용자가 요청한 3가지(cliff 전수조사/scan budget 연속화/측정기반 마진) 전부 완료. 다음: 사용자가 "check_feasibility 9번 호출도 사실 utils.py 탓이 아니라 우리 코드가 비효율적이었던 것"이라는 점을 짚으며, 지금까지의 로컬/스트레스 인스턴스 데이터로 전체 코드를 다시 훑어 "진짜 가장 심각한 병목"을 찾아보자고 제안 -- 오늘 적용한 수정들 때문에 프로파일이 이미 달라졌을 테니 combined_stress_3400/x16에서 재프로파일링부터 시작.
+
+## 2026-07-22 (이어서 8) -- Block.bounding_rect() 전역 캐싱, 사용자 지적("check_feasibility 9번은 코드 비효율이었지 utils.py 탓 아니었잖아")에 대한 후속 작업
+
+사용자가 오늘의 check_feasibility 중복 제거 건을 짚으며 "다른 큰 비용들도 사실 우리 코드 비효율일 수 있으니 재프로파일링해서 진짜 가장 심각한 병목을 찾자"고 제안. combined_stress_3400을 최신 코드(오늘 3개 fix 전부 반영)로 재프로파일링 후 `pstats.print_callers`로 `bounding_rect` 호출자 breakdown 확인.
+
+결과: 306만 회 남은 bounding_rect 호출 중 170만 회(56%)가 `_find_earliest_slot`에서(오늘 오전 `_candidate_positions_maxrects2`에만 적용했던 캐싱이 여기 빠져있었음), 그리고 결정적으로 **check_feasibility(utils.py) 자체도 bay별 Block 리스트를 Stage 2/3/4 전체에서 재사용하면서 각 스테이지가 독립적으로 bounding_rect()를 또 호출** -- 개별 호출부 캐싱으론 닿을 수 없는 utils.py 내부 비용.
+
+**수정**: 개별 호출부 캐싱(`_cached_bounding_rect` 래퍼)을 폐기하고, `baseline_greedy.py`가 import될 때 `Block.bounding_rect` 메서드 자체를 클래스 레벨에서 패치. utils.py 파일은 안 건드리고 런타임에 이미 로드된 클래스 객체에 캐싱 속성만 추가하는 방식이라, check_feasibility를 포함한 모든 코드가 자동으로 혜택을 받음.
+
+**검증**: bounding_rect 호출 304만->30.6만(~90%↓), 상위 30위 밖으로 밀려남. x16/combined_3400 각 3회 -> 전부 feasible, combined_3400 objective가 143.7억~149.9억 -> 124억~128억으로 개선(절약된 시간이 Phase 3에 재투자됨). 40개 로버스트 40/40. `experiment/global-bbox-cache` -> main merge.
+
+**남은 최대 병목**: `_candidate_positions_maxrects2`(MaxRects 후보생성) 자체의 O(m×freelist²) 재생 비용 -- 이건 캐싱 버그가 아니라 매 호출이 진짜 새 계산이라 생기는 알고리즘적 복잡도. 진짜 해법(free-rect 리스트를 호출 간 persistent 유지)은 코드에 이미 힌트가 남아있지만, sliver-pruning 임계값을 전역 최솟값 기준으로 바꿔야 하는 정확성 이슈 때문에 미뤄진 상태 -- 오늘 것들보다 크고 리스크 있는 별도 프로젝트로 남김. 사용자에게 이 프로젝트를 지금 할지 오늘은 여기서 멈출지 문의.

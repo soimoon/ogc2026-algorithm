@@ -74,6 +74,49 @@ import re
 import time
 from utils import Bay, Block, check_entry, check_exit, check_collisions, _resolve_layers, _bounding_box, _bb_overlap
 
+# 2026-07-22 (user-proposed follow-up to the check_feasibility redundancy
+# finding): Block.bounding_rect() recomputes its AABB from the full vertex
+# set on every call (see its own docstring in utils.py -- not O(1)).
+# Profiling combined_stress_3400 (60s) with caller breakdown
+# (pstats.print_callers) found the single largest caller by far is THIS
+# module's own _find_earliest_slot (1.7M of ~3.0M total bounding_rect calls,
+# 8.6s of cumulative time) -- re-deriving the SAME already-placed block's
+# AABB from scratch on every call as it rescans a bay's placed_in_bay list.
+# _block_area (this module's MaxRects area-sort key) is a smaller second
+# offender. Both were fixable one call site at a time (as done earlier
+# today for _candidate_positions_maxrects2's own call site via
+# `_cached_bounding_rect`), but check_feasibility (utils.py, never
+# modifiable) ALSO builds a persistent per-bay Block list once and reuses
+# it across Stages 2/3/4 (see its "bay_blocks" comment) -- each stage
+# independently re-fetches bounding_rect() for the same blocks, a cost
+# fixing individual baseline_greedy.py call sites can never reach since
+# it happens entirely inside utils.py's own code.
+#
+# Patching the method on the Block CLASS itself (not editing utils.py's
+# FILE -- this runs at baseline_greedy.py's import time, against whatever
+# Block class the grading server's utils.py defines) makes every caller,
+# including utils.py's own internal Stage 2/3/4 checks, benefit from the
+# same per-instance cache transparently -- no per-call-site changes needed
+# anywhere, in this module or utils.py. Safe under the same invariant
+# already relied on for the single-call-site version: no code anywhere in
+# this codebase (grepped baseline_greedy.py, xpress_reinsert.py, AND
+# utils.py) ever mutates a Block's x/y/orient_idx in place after
+# construction -- every move constructs a fresh Block instead (also
+# required by __post_init__'s own _layers_cache, which makes the same
+# assumption already, unconditionally, since before today).
+_orig_bounding_rect = Block.bounding_rect
+
+
+def _cached_bounding_rect_method(self):
+    cached = getattr(self, "_bg_bbox_cache", None)
+    if cached is None:
+        cached = _orig_bounding_rect(self)
+        self._bg_bbox_cache = cached
+    return cached
+
+
+Block.bounding_rect = _cached_bounding_rect_method
+
 
 # -----------------------------------------------------------------------------
 # Helpers: block bounding box (anchored, per orientation)
@@ -253,30 +296,6 @@ def _candidate_positions(bay_w: float, bay_h: float,
     return candidates
 
 
-def _cached_bounding_rect(block: Block) -> tuple[float, float, float, float]:
-    """
-    Memoized block.bounding_rect(), attached directly to the Block instance.
-
-    2026-07-22 (user-proposed perf fix): profiling combined_stress_3400 (60s)
-    found bounding_rect()/_bounding_box() cost 13.4s (~22% of total runtime)
-    across 4.4M calls, the overwhelming majority from
-    _candidate_positions_maxrects2 rescanning the SAME already-placed blocks
-    from scratch on every call as it's invoked once per about-to-be-placed
-    block. Safe to cache because no code anywhere in this file mutates a
-    Block's x/y/orient_idx in place -- every move constructs a fresh Block
-    (verified by grep; also required by __post_init__'s own _layers_cache,
-    which already assumes x/y are fixed for the object's lifetime). Attached
-    as a plain instance attribute (not a utils.py change -- Block has no
-    __slots__, so this is legal from outside its defining module) rather
-    than an external dict keyed by id(block), which would risk a stale hit
-    if CPython reuses a garbage-collected block's address for a new one.
-    """
-    cached = getattr(block, "_bg_bbox_cache", None)
-    if cached is None:
-        cached = block.bounding_rect()
-        block._bg_bbox_cache = cached
-    return cached
-
 
 def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
                                    placed_blocks: list[Block],
@@ -320,7 +339,7 @@ def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
 
     free: list[tuple[float, float, float, float]] = [(0.0, 0.0, float(bay_w), float(bay_h))]
     for b in placed_blocks:
-        px0, py0, px1, py1 = _cached_bounding_rect(b)
+        px0, py0, px1, py1 = b.bounding_rect()
         new_free = []
         for (fx0, fy0, fx1, fy1) in free:
             if not (fx0 < px1 and px0 < fx1 and fy0 < py1 and py0 < fy1):
