@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import baseline_greedy
 from utils import check_feasibility
 
-RULES = ["edd", "atc", "slack", "regret"]
+RULES = ["edd", "atc", "slack", "regret", "area", "area_slack"]
 
 
 def _collect_instance_files(patterns: list[str]) -> list[Path]:
