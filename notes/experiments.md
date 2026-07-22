@@ -219,3 +219,13 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 **검증**: bounding_rect 호출 304만->30.6만(~90%↓), 상위 30위 밖으로 밀려남. x16/combined_3400 각 3회 -> 전부 feasible, combined_3400 objective가 143.7억~149.9억 -> 124억~128억으로 개선(절약된 시간이 Phase 3에 재투자됨). 40개 로버스트 40/40. `experiment/global-bbox-cache` -> main merge.
 
 **남은 최대 병목**: `_candidate_positions_maxrects2`(MaxRects 후보생성) 자체의 O(m×freelist²) 재생 비용 -- 이건 캐싱 버그가 아니라 매 호출이 진짜 새 계산이라 생기는 알고리즘적 복잡도. 진짜 해법(free-rect 리스트를 호출 간 persistent 유지)은 코드에 이미 힌트가 남아있지만, sliver-pruning 임계값을 전역 최솟값 기준으로 바꿔야 하는 정확성 이슈 때문에 미뤄진 상태 -- 오늘 것들보다 크고 리스크 있는 별도 프로젝트로 남김. 사용자에게 이 프로젝트를 지금 할지 오늘은 여기서 멈출지 문의.
+
+## 2026-07-22 (이어서 9) -- MaxRects orientation간 공유 (범위 축소된 버전), 그리고 Phase 1 시간 배분 재검토로 방향 전환
+
+원래 계획(free-rect 리스트를 블록 간/호출 간 persistent)을 설계하다가 시간 의존 정확성 문제 발견: `active_in_bay`가 `e_k > r_time`으로 필터링되고 블록 처리 순서가 EDD(마감일)라 release_time 순서가 아니라서, "활성" 집합이 호출마다 비단조적으로 바뀜 -- 단순 persistent 캐시는 틀릴 수 있음(구간트리 같은 시공간 자료구조가 필요한 훨씬 큰 프로젝트). 사용자 확인 후 범위를 안전한 부분집합으로 축소: **같은 블록의 orientation간 공유**(시간 컨텍스트 완전히 동일, 문제 없음).
+
+`_candidate_positions_maxrects2`를 `_maxrects_free_space`+`_maxrects_extract_candidates`로 분리, `_place_blocks`가 bay당 1회만 free-space를 계산(전역 min_width/min_height 사용, 항상 보수적이라 안전) 후 orientation 루프에서는 값싼 extract만 반복. 동등성 검증 스크립트로 기존 방식과 결과 후보 집합 비교 -> 0 불일치 확인 후 진행.
+
+**실측은 애매함**: `_maxrects_free_space` 호출 8배 감소(32,618->4,164)했지만, 전역 최솟값이 더 보수적이라 호출당 유지하는 조각 수가 늘어 O(freelist²) pruning 비용이 커짐 -- 전체 wall-clock은 이전과 비슷한 수준(50s대), 순이익이 이번 샘플에서는 뚜렷하지 않음. 정확성은 확실(x16/combined_3400 각 3회 전부 feasible, 40개 로버스트 40/40) -> main merge, 하지만 순이익 재확인은 다음 과제.
+
+**사용자가 더 근본적인 질문 제기**: "Phase 1은 원래 유효한 뼈대를 순식간에 만들어야 하는 거 아닌가?" -- 오늘 모은 로그에서 Phase1 elapsed/전체 elapsed 비율을 직접 뽑아보니 prob_1(100블록)=58%, combined_3400(3400블록)=53-55%, x16(4000블록)=50%로 **인스턴스 크기와 무관하게 절반 안팎으로 놀랍도록 일정** -- `phase1_deadline = t_start + timelimit*0.5`로 아예 못박혀 있어서 설계상 그런 것. 결정적으로 prob_1은 100블록 전부 `fallback=0`(강제배치 없이 정상 탐색)인데도 8.72초가 걸렸고 Phase 3는 예산이 남았는데도 5라운드 연속 무개선으로 스스로 멈춤 -- 즉 이 케이스에서 Phase1이 오래 걸린 건 데드라인에 밀려서가 아니라 블록당 순수 탐색 비용(~87ms/블록)이 실제로 그만큼 든 것. 오늘 한 캐싱류 최적화는 Phase1을 "빠르게"만 할 뿐 이 50% 천장 자체는 안 건드려서, Phase1이 이미 일찍 끝나는 게 아니면 체감 효과가 제한적 -- 다음 방향은 "Phase1의 50% 배분이 실제로 정당한가" 쪽으로 갈 가능성.
