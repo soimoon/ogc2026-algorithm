@@ -850,6 +850,41 @@ OVERTIME_MAX_ORIENTATIONS = 2
 # (downstream re-validation against the FULL bay state is unaffected).
 XPRESS_CANDIDATE_MAX_SOURCE_BLOCKS = 50
 
+
+def _dynamic_scan_cap(now: float, phase_start: float, hard_deadline: float | None,
+                      base_cap: int, floor_cap: int) -> int:
+    """
+    Scan budget that shrinks continuously from base_cap toward floor_cap as
+    the phase's own hard_deadline approaches, instead of jumping between
+    exactly two fixed values the instant a `deadline` marker is crossed
+    (2026-07-22, user-proposed, replacing the old
+    CANDIDATE_SCAN_CAP->OVERTIME_SCAN_CAP binary switch in _place_blocks).
+
+    Motivation: the old switch meant a block evaluated a split second before
+    `deadline` still got the FULL base_cap, while the very next block (after
+    a few more milliseconds of pure wall-clock noise) suddenly got only
+    floor_cap -- the same "cliff" pattern already fixed for the
+    force-place/no-force-place decision itself (see notes/
+    algorithm_overview.md #58), just one level down, at the scan-budget
+    level. A continuous ramp means no single block right at the boundary
+    can still claim the full budget an instant before the switch flips, and
+    it naturally self-calibrates to whatever this run's actual machine
+    throughput turns out to be: on a slow run, elapsed time (and therefore
+    the ratio) advances faster per block placed, so the cap shrinks sooner
+    -- without needing a separate throughput benchmark.
+
+    hard_deadline=None means the caller never opted into this phase's time
+    budgeting at all (e.g. a call site with no deadline concept) --
+    returns base_cap unchanged in that case, identical to before this
+    function existed.
+    """
+    if hard_deadline is None:
+        return base_cap
+    total = max(1e-6, hard_deadline - phase_start)
+    time_left_ratio = max(0.0, min(1.0, (hard_deadline - now) / total))
+    return max(floor_cap, int(round(base_cap * time_left_ratio)))
+
+
 def _top_candidates_for_block(bi: int, blk_data: dict, bays: list[Bay],
                               bay_placed: list[list[Block]],
                               bay_schedule: list[list[tuple[int, int]]],
@@ -2116,14 +2151,26 @@ def _place_blocks(
         # noise, not a real code difference (see notes/algorithm_overview.md).
         # Fix: once `deadline` passes, don't force-place immediately -- keep
         # searching (same candidate/geometry machinery, no new logic) but at
-        # OVERTIME_SCAN_CAP instead of CANDIDATE_SCAN_CAP and restricted to
-        # the single most-preferred bay (see below), so cost stays bounded
-        # regardless of how many blocks land in this window. Only once
-        # hard_deadline ALSO passes (or hard_deadline is None, i.e. the
-        # caller didn't opt into this mitigation -- e.g. _repair/_improve's
-        # greedy fallback calls) does a block fall back to _force_place,
-        # same guaranteed ceiling as before -- this just replaces an instant
-        # cliff at the first deadline with a cheap-but-real search first.
+        # a reduced scan budget and restricted to the single most-preferred
+        # bay (see below), so cost stays bounded regardless of how many
+        # blocks land in this window. Only once hard_deadline ALSO passes
+        # (or hard_deadline is None, i.e. the caller didn't opt into this
+        # mitigation -- e.g. _repair/_improve's greedy fallback calls) does
+        # a block fall back to _force_place, same guaranteed ceiling as
+        # before -- this just replaces an instant cliff at the first
+        # deadline with a cheap-but-real search first.
+        #
+        # 2026-07-22 (later same day, user-proposed): the scan budget itself
+        # (see `_dynamic_scan_cap` below) was originally a second binary
+        # switch nested inside this one -- CANDIDATE_SCAN_CAP right up until
+        # `deadline`, then instantly OVERTIME_SCAN_CAP -- which reintroduces
+        # the exact same cliff shape one level down (a block evaluated a
+        # split second before `deadline` still gets the full budget; the
+        # next one gets a fifth of it). Replaced with a continuous ramp from
+        # CANDIDATE_SCAN_CAP toward OVERTIME_SCAN_CAP as `hard_deadline`
+        # approaches, so timing noise right at the boundary can no longer
+        # cause one block to claim a disproportionate share right before the
+        # switch flips.
         past_deadline      = deadline is not None and time.time() > deadline
         past_hard_deadline = hard_deadline is not None and time.time() > hard_deadline
         in_overtime        = past_deadline and hard_deadline is not None and not past_hard_deadline
@@ -2274,7 +2321,13 @@ def _place_blocks(
                 for oi in orient_range:
                     if deadline_hit:
                         break
-                    scan_budget = OVERTIME_SCAN_CAP if in_overtime else CANDIDATE_SCAN_CAP
+                    if hard_deadline is not None and t_start is not None:
+                        scan_budget = _dynamic_scan_cap(
+                            time.time(), t_start, hard_deadline,
+                            CANDIDATE_SCAN_CAP, OVERTIME_SCAN_CAP,
+                        )
+                    else:
+                        scan_budget = OVERTIME_SCAN_CAP if in_overtime else CANDIDATE_SCAN_CAP
                     blk_bb = _block_bbox(blk_data, oi)
                     lx0_oi, ly0_oi, lx1_oi, ly1_oi = blk_bb
                     # Require a valid integer reference-point position to exist:
