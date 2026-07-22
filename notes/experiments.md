@@ -178,3 +178,12 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 **아직 안 한 것**: same-bay-first(가설 1)는 손 안 댐, 다음 세션(또는 이어지는 이번 세션)에 별도 브랜치에서 진행 예정. wholebay의 MIP 자체 비용(후보 생성과 별개)도 미해결. NFP(No-Fit Polygon) 도입도 사용자가 제안 -- 이번엔 "더 빽빽하게 채우기"(2026-07-20에 투자가치 없음으로 이미 결론난 각도)가 아니라 "충돌검사 자체를 더 싸게 만들기"(속도 각도)라는 다른 프레이밍으로, same-bay-first 다음 별도 브랜치에서 진행 예정.
 
 이 세션 변경분(오늘 총 7개 fix)을 main에 커밋.
+
+## 2026-07-22 (이어서 5) -- same-bay-first 결론, Improve 배치 확인, NFP 프로파일링 검증, check_feasibility 중복 제거 + bbox 캐싱
+
+- **same-bay-first(가설 1) 최종 결론**: 블록 복제 스트레스(x4/x8)에서는 ON/OFF 우열이 배율에 따라 뒤집혀 신뢰 불가 -> 서로 다른 14개 로컬 인스턴스를 합친 3400블록 이질적 스트레스 인스턴스로 재검증하니 ON이 4회 전부 일관되게 4-15% 우세. P4~6 고착의 원인에서 제외, 기본값 ON 유지 (`algorithm_overview.md` #60).
+- **`_improve`의 매 accept 전체 재검증을 `CONFIRM_CHECK_INTERVAL=10`회마다 1회+반환 직전 무조건 1회로 배치** (사용자 제안, 오늘 쌓인 섀도검증 624건/불일치 0건 근거). 결함 주입(몽키패치로 거짓 objective 유발)으로 MISMATCH 감지 및 체크포인트 롤백 정상 작동 확인. combined_3400 300초 before/after: 124,500,588,192 -> 124,116,249,147 개선(단, 13라운드 이후 갈라진 거라 타이밍 노이즈 영향 완전 배제는 못 함). 40개 로버스트 40/40 feasible (`algorithm_overview.md` #61).
+- **NFP 도입 전 프로파일링 검증** (사용자 제안 "측정 먼저"): combined_stress_3400(60초) cProfile 결과 Shapely 자체 비용은 전체의 ~7-8%뿐, 실제 병목은 `check_feasibility`(9회, 33%)와 우리 코드의 MaxRects 후보생성(`_candidate_positions_maxrects2`, 28%, Shapely 미사용 순수 AABB 산술) -> **NFP 투자 대비 효과 낮다고 판단, 보류**.
+- 사용자 재질문("check_feasibility가 진짜 그렇게 비싼 건지, 아니면 우리가 비효율적으로 여러 번 부르는 건지") 계기로 9회 호출 지점 전수 추적 -> Phase 2.5/2.6의 `pre_result`/`pre_rj_result` 2곳이 직전 단계가 이미 계산해둔 것과 완전히 동일한 순수 중복 호출이었음(Phase 2.6은 바로 옆의 `last_verified_result`를 아예 참조도 안 하고 있었음). `_repair()`가 `(assignments, verified_result)`를 반환하도록 바꾸고 Phase 2.5/2.6이 이를 재사용하도록 수정. 별도로 `_candidate_positions_maxrects2`가 이미 배치된 블록의 `bounding_rect()`를 매 호출 재계산하던 것을 Block 인스턴스에 캐싱(`_cached_bounding_rect`, x/y/orient_idx가 코드베이스 전체에서 in-place mutate 안 됨을 grep으로 확인 후 안전성 판단)하는 걸로 대체 (`algorithm_overview.md` #62).
+- **검증**: combined_stress_3400 재프로파일링 -> check_feasibility 9->7회(정확히 2회 감소), bounding_rect 440만->324만 호출(~26%↓), 전체 60.0s->57.9s(~3.5%↓, 시간적응형 특성상 예상보다 작은 개선). 40개 로컬 인스턴스 20초 로버스트 -> 40/40 feasible, 0 크래시. `experiment/checkfeas-reuse-bbox-cache` 브랜치에서 main으로 merge.
+- **다음 논의**: 시간 기반(wall-clock deadline) 아키텍처 자체의 안정성 문제 제기 -- 채점 서버는 1회만 채점하는데 타이밍 노이즈로 품질이 크게 흔들릴 수 있다는 우려. 3가지 후속 작업 합의: (1) 아직 이진 deadline cliff로 남은 곳 전수조사, (2) 로컬/서버 처리속도 차이를 자가보정하는 work-budget 설계, (3) safety margin(78%/95% 등)을 서버 스펙(4 CPU/16GB) 기준으로 재검토. 다음 세션(또는 이어지는 이번 세션)에서 순서대로 진행 예정.

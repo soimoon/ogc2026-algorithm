@@ -352,6 +352,12 @@
     **실측 효과(3400블록 이질적 인스턴스, 300초, before=매번확인 vs after=배치)**: after가 라운드 하나 더 완주(대형 wholebay, K~700+, gain 823M 추가)해서 objective가 124,500,588,192 -> 124,116,249,147로 개선 -- 다만 12라운드까지는 두 버전이 구조적으로 거의 동일했다가 13라운드 이후 갈라진 것이라, 타이밍 노이즈의 영향도 배제 못 함(재현성 추가 확인은 다음 세션 과제로 남김).
     **검증**: prob_1/x4/x16/combined_3400(3회)에서 MISMATCH 0건. 40개 로컬 인스턴스 20초 로버스트 테스트(이 fix 반영 후) -> 40/40 feasible, 0 크래시/infeasible/시간초과.
 
+62. **NFP 도입 전 프로파일링으로 전제 검증 -- Shapely 비용 미미, 실제 병목은 check_feasibility 중복 호출 + bounding_rect 재계산 (사용자 제안, 2026-07-22)**
+    NFP(No-Fit Polygon) 도입에 앞서 "Shapely 폴리곤 교차 검사가 실제로 비용의 큰 비중을 차지하는지" 먼저 프로파일링(`cProfile`, combined_stress_3400, 60초)으로 검증. 결과: `check_feasibility`(9회 호출) 19.9s(33%), 우리 코드의 `_candidate_positions_maxrects2`(순수 AABB 산술, Shapely 미사용) 17.0s(28%), 반면 Shapely 자체 연산(intersection/is_valid/polygon 생성 전부 합산) 은 ~4-5s(~7-8%)에 불과. `check_entry`/`check_exit`/`check_collisions`의 자체 실행시간도 1.5% 미만 -- 비용 대부분이 이미 있는 AABB 프리필터(`bounding_rect`/`_bounding_box`, 440만 호출, 13.4s)에서 나옴. **결론: NFP는 이미 작은 비중(7-8%)을 노리는 것이라 투자 대비 효과가 낮음, 보류.**
+    사용자가 "check_feasibility가 그렇게 비싼 게 utils.py 자체의 본질적 한계인지, 아니면 우리 코드가 비효율적으로 여러 번 부르는 건지"를 재질문 -- 호출 지점 9곳 전수 추적 결과, **Phase 2.5(left-justify)의 `pre_result`와 Phase 2.6(right-justify)의 `pre_rj_result` 2곳이 순수 중복**이었음: 바로 직전 단계(`_repair` 또는 Phase 2.5)가 이미 계산해서 `last_verified_result`에 들고 있는 것과 정확히 동일한 내용을 처음부터 다시 계산하고 있었음(Phase 2.6은 `last_verified_result` 변수가 바로 옆에 있는데도 아예 참조하지 않고 있었음 -- 단순 누락).
+    **수정**: (a) `_repair()`가 `assignments`만이 아니라 `(assignments, verified_result)`를 반환하도록 변경 -- `verified_result`는 반환 시점의 `result`가 feasible이었을 때만 채워짐(최종 guarantee 강제배치가 발동해 `assignments`를 추가로 건드린 경우는 `None`, 그 경우 호출부가 기존처럼 재계산). (b) Phase 2.5가 이 값을 `pre_result`로 재사용(없으면 기존처럼 재계산). (c) Phase 2.6이 `last_verified_result`(Phase 2.5 산출물, 없으면 `_repair` 산출물)를 `pre_rj_result`로 재사용. (d) `_candidate_positions_maxrects2`가 매 호출마다 이미 배치된 블록들의 `bounding_rect()`를 처음부터 재계산하던 것을, Block 인스턴스에 결과를 직접 캐싱하는 `_cached_bounding_rect()` 헬퍼로 대체 -- Block의 x/y/orient_idx가 이 코드베이스 전체에서 한 번도 in-place로 mutate되지 않는다는 것(항상 새 Block 생성, grep으로 확인 + `__post_init__`의 `_layers_cache`도 동일 전제)에 기반한 안전한 캐싱. `utils.py`는 건드리지 않음(Block에 `__slots__`가 없어 외부에서 속성 추가 가능).
+    **검증**: combined_stress_3400(60초) 재프로파일링 -> `check_feasibility` 9회->7회(예측대로 정확히 2회 감소), `bounding_rect`/`_bounding_box` 440만->324만 호출(~26% 감소, 전체 예상보다는 작음 -- 알고리즘이 시간 적응형이라 절약된 시간이 다시 재투자되면서 실행 경로 자체가 달라짐, 오늘 계속 나온 타이밍 노이즈 효과), 전체 60.0s->57.9s(~3.5%). 40개 로컬 인스턴스 20초 로버스트 테스트 -> 40/40 feasible, 0 크래시.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
