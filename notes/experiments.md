@@ -187,3 +187,13 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 - 사용자 재질문("check_feasibility가 진짜 그렇게 비싼 건지, 아니면 우리가 비효율적으로 여러 번 부르는 건지") 계기로 9회 호출 지점 전수 추적 -> Phase 2.5/2.6의 `pre_result`/`pre_rj_result` 2곳이 직전 단계가 이미 계산해둔 것과 완전히 동일한 순수 중복 호출이었음(Phase 2.6은 바로 옆의 `last_verified_result`를 아예 참조도 안 하고 있었음). `_repair()`가 `(assignments, verified_result)`를 반환하도록 바꾸고 Phase 2.5/2.6이 이를 재사용하도록 수정. 별도로 `_candidate_positions_maxrects2`가 이미 배치된 블록의 `bounding_rect()`를 매 호출 재계산하던 것을 Block 인스턴스에 캐싱(`_cached_bounding_rect`, x/y/orient_idx가 코드베이스 전체에서 in-place mutate 안 됨을 grep으로 확인 후 안전성 판단)하는 걸로 대체 (`algorithm_overview.md` #62).
 - **검증**: combined_stress_3400 재프로파일링 -> check_feasibility 9->7회(정확히 2회 감소), bounding_rect 440만->324만 호출(~26%↓), 전체 60.0s->57.9s(~3.5%↓, 시간적응형 특성상 예상보다 작은 개선). 40개 로컬 인스턴스 20초 로버스트 -> 40/40 feasible, 0 크래시. `experiment/checkfeas-reuse-bbox-cache` 브랜치에서 main으로 merge.
 - **다음 논의**: 시간 기반(wall-clock deadline) 아키텍처 자체의 안정성 문제 제기 -- 채점 서버는 1회만 채점하는데 타이밍 노이즈로 품질이 크게 흔들릴 수 있다는 우려. 3가지 후속 작업 합의: (1) 아직 이진 deadline cliff로 남은 곳 전수조사, (2) 로컬/서버 처리속도 차이를 자가보정하는 work-budget 설계, (3) safety margin(78%/95% 등)을 서버 스펙(4 CPU/16GB) 기준으로 재검토. 다음 세션(또는 이어지는 이번 세션)에서 순서대로 진행 예정.
+
+## 2026-07-22 (이어서 6) -- 시간기반 아키텍처 안정성 재검토: cliff 전수조사 + scan budget 연속화
+
+사용자 문제제기: "채점 서버는 1회만 채점하는데, 시간 기반(wall-clock) 아키텍처가 근본적으로 안정적일 수 있는가?" 3가지 후속 작업 합의(순서대로):
+
+1. **전수조사**: `time.time() > deadline` 18곳 전부 확인 -> 새로운 이진 cliff 없음. 대부분 오늘 이미 고친 안전한 패턴이거나 죽은 코드(`_regret_construct`/`_place_blocks_batched`, `priority_rule`/`construction_mode`가 실제로 그 값으로 호출된 적 없음). `_improve`의 greedy 폴백만 미적용 상태로 남았으나 blast radius가 작아(K≤12, "개선 안 되면 버림" 로직) 기존 판단 유지.
+2. **scan budget 연속화**: 사용자가 구체적 수식 제안(`time_left_ratio = (hard_deadline-now)/phase1_total_budget`, `dynamic_scan_cap = max(floor, int(base*ratio))`) -> `_dynamic_scan_cap()` 헬퍼로 구현, `_place_blocks`의 `OVERTIME_SCAN_CAP`/`CANDIDATE_SCAN_CAP` 이진 전환을 대체. x16 3회 반복 전부 feasible(63.2~63.8s), 40개 로버스트 40/40. `experiment/dynamic-scan-cap` -> main merge.
+3. **측정 기반 안전마진**: 다음 작업으로 진행 예정 (`algorithm_overview.md` #64까지 기록됨, #65는 이 항목이 될 것).
+
+**핵심 통찰**: 카운트 기반 캡(`CANDIDATE_SCAN_CAP` 등)은 사실 안전장치가 아니라 품질 레버였음 -- 어차피 매 K회 반복마다 `time.time()` 체크가 있어서 실제 소요 시간은 기계 속도와 무관하게 이미 timelimit 안에 묶여 있음. 진짜 위험한 건 이 캡이 "이진 전환"이라 경계에서 타이밍 노이즈로 요행이 갈리는 것.

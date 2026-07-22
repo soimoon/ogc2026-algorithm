@@ -358,6 +358,13 @@
     **수정**: (a) `_repair()`가 `assignments`만이 아니라 `(assignments, verified_result)`를 반환하도록 변경 -- `verified_result`는 반환 시점의 `result`가 feasible이었을 때만 채워짐(최종 guarantee 강제배치가 발동해 `assignments`를 추가로 건드린 경우는 `None`, 그 경우 호출부가 기존처럼 재계산). (b) Phase 2.5가 이 값을 `pre_result`로 재사용(없으면 기존처럼 재계산). (c) Phase 2.6이 `last_verified_result`(Phase 2.5 산출물, 없으면 `_repair` 산출물)를 `pre_rj_result`로 재사용. (d) `_candidate_positions_maxrects2`가 매 호출마다 이미 배치된 블록들의 `bounding_rect()`를 처음부터 재계산하던 것을, Block 인스턴스에 결과를 직접 캐싱하는 `_cached_bounding_rect()` 헬퍼로 대체 -- Block의 x/y/orient_idx가 이 코드베이스 전체에서 한 번도 in-place로 mutate되지 않는다는 것(항상 새 Block 생성, grep으로 확인 + `__post_init__`의 `_layers_cache`도 동일 전제)에 기반한 안전한 캐싱. `utils.py`는 건드리지 않음(Block에 `__slots__`가 없어 외부에서 속성 추가 가능).
     **검증**: combined_stress_3400(60초) 재프로파일링 -> `check_feasibility` 9회->7회(예측대로 정확히 2회 감소), `bounding_rect`/`_bounding_box` 440만->324만 호출(~26% 감소, 전체 예상보다는 작음 -- 알고리즘이 시간 적응형이라 절약된 시간이 다시 재투자되면서 실행 경로 자체가 달라짐, 오늘 계속 나온 타이밍 노이즈 효과), 전체 60.0s->57.9s(~3.5%). 40개 로컬 인스턴스 20초 로버스트 테스트 -> 40/40 feasible, 0 크래시.
 
+63. **시간 기반 아키텍처 안정성 재검토 1단계: 남은 이진 cliff 전수조사 -- 새로운 cliff 없음 확인 (사용자 지시, 2026-07-22)**
+    "채점 서버는 1회만 채점하는데 타이밍 노이즈로 품질이 흔들리는 게 근본적으로 괜찮은가"라는 사용자 문제 제기 이후, `baseline_greedy.py`/`xpress_reinsert.py`/`myalgorithm.py`의 `time.time() > deadline` 패턴 18곳 전수 확인. 결과: 대부분 오늘 이미 고친 graceful-degradation/safe-truncation 패턴(호출부가 부분 결과를 안전하게 재검증 후 채택/폐기), 2곳(`_regret_construct`, `_place_blocks_batched`)은 `priority_rule="regret"`/`construction_mode="batched"`가 실제로 한 번도 선택되지 않는 죽은 코드, `xpress_reinsert.py`의 두 곳은 실패 시 안전한 폴백 경로로 전환. 유일하게 남은 건 `_improve`의 greedy 폴백(`hard_deadline` 미적용)인데, K가 작고(보통 ≤12) Phase 3의 "개선 안 되면 버림" 로직 덕에 최악의 경우가 "라운드 하나 낭비"뿐이라 기존의 의도적 방치가 여전히 타당함. **결론: 새로운 이진 cliff는 발견되지 않음.**
+
+64. **시간 기반 아키텍처 안정성 재검토 2단계: `_place_blocks`의 scan budget을 이진 전환에서 연속 램프로 (사용자 제안, 2026-07-22)**
+    `_place_blocks`의 overtime 메커니즘(#58)이 여전히 `scan_budget = OVERTIME_SCAN_CAP if in_overtime else CANDIDATE_SCAN_CAP`라는 **두 값짜리 이진 전환**이었음 -- `deadline` 넘기 직전 블록은 여전히 CANDIDATE_SCAN_CAP(50) 전체를, 넘긴 직후 블록은 갑자기 OVERTIME_SCAN_CAP(5)만 받아서 "같은 cliff가 한 단계 아래에서 재발"하는 구조. 사용자 제안: `time_left_ratio = (hard_deadline - now) / (hard_deadline - phase_start)` 기반으로 `scan_budget`을 `base_cap`에서 `floor_cap`까지 선형으로 연속 감소시키는 `_dynamic_scan_cap()` 헬퍼 신설. 별도의 처리량 벤치마크 없이도 "느린 기계일수록 블록당 경과시간이 더 빨리 누적 -> ratio가 더 빨리 줄어듦"이라는 방식으로 자연스럽게 기계 속도에 맞춰짐(자가보정 효과를 부작용으로 얻음).
+    **검증**: x16(4000블록) 스트레스 인스턴스 3회 반복 -> 전부 feasible, elapsed 63.2~63.8s(60s 예산 대비 일관된 오버런, 이전 그래프에이션 수정 이후 수준과 동등하거나 더 좋음). 40개 로컬 인스턴스 20초 로버스트 테스트 -> 40/40 feasible, 0 크래시. `experiment/dynamic-scan-cap` 브랜치에서 main으로 merge.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
