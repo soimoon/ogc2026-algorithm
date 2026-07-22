@@ -1452,10 +1452,12 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     timelimit     : wall-clock time limit in seconds
     repair_mode   : "greedy" (default) or "simple" -- see module docstring for details
     priority_rule : "edd" (default), "slack" (min-slack-first / MST), "atc",
-                    or "regret" -- Phase-1 insertion order/construction. See
-                    _atc_priority for the ATC adaptation and
-                    _regret_construct for the regret-based dynamic
-                    construction used here.
+                    "area" (pure space-packing, descending footprint size),
+                    "area_slack" (blended: rank-sum of slack-ascending and
+                    area-descending orders), or "regret" -- Phase-1 insertion
+                    order/construction. See _atc_priority for the ATC
+                    adaptation and _regret_construct for the regret-based
+                    dynamic construction used here.
 
                     Empirically (analysis/priority_rule_compare.py, all 40
                     train instances, 15s/instance): plain EDD won on 21/40
@@ -1473,6 +1475,17 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                     -- not yet benchmarked against EDD the same way; treat as
                     experimental until analysis/priority_rule_compare.py is
                     re-run with it included.
+
+                    "area"/"area_slack" added 2026-07-22 (user-proposed) --
+                    NOT meant to replace EDD as the default (EDD still wins
+                    the plurality locally). Motivation: EDD only wins 21/40,
+                    so on the OTHER 19 a structurally different starting
+                    basin might help -- these exist specifically to be mixed
+                    into _iterated_greedy's restart cycle (see
+                    myalgorithm._iterated_greedy) alongside EDD, giving Phase
+                    3 a genuinely different construction to improve on if
+                    the EDD-seeded restart(s) don't pan out, rather than to
+                    be used standalone.
     atc_k         : ATC lookahead parameter (only used when priority_rule="atc").
                     Larger = closer to pure SPT, smaller = closer to min-slack-first.
     annealing     : False (default) -- Phase 3 stays strict hill-climbing.
@@ -1738,6 +1751,50 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                 key=lambda i: (_slack(i), blocks_data[i]["due_date"])
             )
             rule_label = "MST(min-slack)"
+        elif priority_rule == "area":
+            # 2026-07-22 (user-proposed): pure space-packing-first order --
+            # ignores due dates entirely, places the biggest footprints
+            # first (classic bin-packing heuristic: big items are hardest
+            # to fit later once the bay is more fragmented). Orientation 0's
+            # bbox is representative since a block's true footprint area is
+            # orientation-invariant (rotations only swap w/h). Restart-
+            # diversification candidate: deliberately orthogonal to EDD, to
+            # give Phase 3 a structurally different starting basin on
+            # instances where EDD's local win rate (21/40, see
+            # analysis/priority_rule_compare.py) doesn't hold.
+            def _area(i: int) -> float:
+                bb = _block_bbox(blocks_data[i], 0)
+                return (bb[2] - bb[0]) * (bb[3] - bb[1])
+            sorted_indices = sorted(
+                range(n_blocks),
+                key=lambda i: (-_area(i), blocks_data[i]["due_date"])
+            )
+            rule_label = "Area-descending"
+        elif priority_rule == "area_slack":
+            # 2026-07-22 (user-proposed): blended space+time order. Rank-sum
+            # instead of a weighted linear combination (slack_norm*w1 +
+            # area_norm*w2) specifically to avoid introducing a new tunable
+            # weight with no data to set it from -- each block gets its
+            # ordinal rank under "slack ascending" (urgency) and "area
+            # descending" (packing difficulty) separately, then the two
+            # ranks are summed. A block that's both urgent AND large sorts
+            # very early (low rank-sum on both axes); a block that's neither
+            # sorts late; asymmetric cases (urgent-but-small,
+            # large-but-not-urgent) land in between based on how extreme
+            # each rank actually is, which a fixed-weight formula can't
+            # adapt to per-instance.
+            def _area(i: int) -> float:
+                bb = _block_bbox(blocks_data[i], 0)
+                return (bb[2] - bb[0]) * (bb[3] - bb[1])
+            _slack_order = sorted(range(n_blocks), key=_slack)
+            _area_order = sorted(range(n_blocks), key=lambda i: -_area(i))
+            _slack_rank = {bi: r for r, bi in enumerate(_slack_order)}
+            _area_rank = {bi: r for r, bi in enumerate(_area_order)}
+            sorted_indices = sorted(
+                range(n_blocks),
+                key=lambda i: (_slack_rank[i] + _area_rank[i], blocks_data[i]["due_date"])
+            )
+            rule_label = "Area+Slack(rank-sum)"
         else:
             sorted_indices = sorted(
                 range(n_blocks),

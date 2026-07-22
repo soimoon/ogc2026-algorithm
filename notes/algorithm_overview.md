@@ -391,6 +391,14 @@
     **검증**: x16/combined_3400 각 3회(자동으로 LARGE 분기) -> 전부 feasible. 40개 로컬 로버스트 -> 40/40 feasible, 0 크래시(이 중 prob_17-20이 300블록이라 LARGE 분기도 실제 로컬 인스턴스로 일부 검증됨). `experiment/shrink-phase1-budget` -> main merge.
     **효과에 대한 솔직한 평가**: 표본이 적어(조건당 2-3회) "평균이 확 좋아진다"는 확신은 없고, 관찰된 건 주로 **대형 인스턴스에서의 분산 감소(일관성 향상)** -- 1회만 채점하는 대회 특성상 가치는 있지만, P4-6에 자릿수 단위 개선을 기대하긴 어려움. 게다가 P4-6가 실제로 300블록 이상인지 자체가 미확인이라, 이 적응형 전환이 P4-6에 적용되는지조차 불확실.
 
+69. **재시작(`_iterated_greedy`)마다 priority_rule을 다양화 -- "5차까지 근본 돌파 없었으니 초기 배치를 다양하게 흩뿌려보자" (사용자 제안, 2026-07-22)**
+    사용자가 EDD가 로컬 21/40만 이긴다는 과거 수치(`priority_rule` 독스트링에 이미 기록)를 근거로, 재시작마다 seed만 바꾸지 말고 priority_rule 자체를 바꿔서 완전히 이질적인 초기 해를 Phase 3에 넘기자고 제안. "Area-descending"(면적 내림차순, 순수 공간 패킹 우선)과 "Area/Slack 혼합"을 새 규칙으로 요청.
+    **기존 인프라 확인**: `analysis/priority_rule_compare.py`가 이미 edd/atc/slack/regret을 40개 인스턴스로 비교하는 도구로 존재. 또한 "bay 절반을 통째로 비우고 MIP로 재조립"이라는 대안 제안(Phase 3 파괴 연산자 대규모화)은 사실 이미 있는 `wholebay` 연산자와 동일한 아이디어이고, 그 연산자의 진짜 병목(O(K²×max_per_block²) MIP 제약 구성, K~170+에서 버거움)이 아직 안 고쳐진 상태임을 확인 -- 이쪽은 훨씬 크고 위험한 별도 과제로 판단, 이번엔 priority rule 다양화를 먼저 진행.
+    **새 규칙 구현**: `"area"`(면적 내림차순, due_date 무시), `"area_slack"`(slack 오름차순 순위 + 면적 내림차순 순위의 순위합 -- 임의 가중치 없이 두 기준을 동등하게 섞음). `greedyalgorithm`의 `priority_rule` 분기에 추가.
+    **최신 코드로 재측정** (`analysis/priority_rule_compare.py`에 area/area_slack 추가 + 별도 3자 비교, 40개 인스턴스, 15초/규칙): **EDD가 오늘 코드에서는 오히려 더 압도적**(두 비교에서 각각 29/40, 33/40 -- 과거 21/40보다 강해짐, 오늘 고친 Phase1/3 개선들이 EDD 우위를 더 키운 것으로 추정). area/area_slack은 각각 6/40, 5/40 승 -- 이길 때는 10~25% 정도지만, **질 때는 파국적**(prob_19에서 area가 838배, prob_18에서 390배 나쁨).
+    **수정**: `myalgorithm._iterated_greedy`가 재시작마다 `_PRIORITY_RULE_CYCLE = ["edd","edd","edd","area_slack","area"]`을 순환. EDD가 1~3번째 시도를 무조건 차지(재시작이 1~3개만 되는 대형/느린 인스턴스는 기존과 완전히 동일하게 동작), 4~5번째는 **남는 예산이 있을 때만** 다양화 규칙 시도. `_iterated_greedy`가 항상 "엄밀히 더 나은 결과만 채택"하는 구조라, 다양화 시도가 지면 그냥 버려질 뿐 최종 결과가 나빠지는 일은 구조적으로 불가능(비용은 기회비용뿐).
+    **검증**: x16/combined_3400 각 3회 -> 전부 feasible, 전부 attempt 1(EDD)만 소진(대형 인스턴스는 재시작 1개뿐이라 이번 변경의 영향 자체가 없음, 예상대로). prob_2(60초)에서 attempt 2가 정확히 새 순환표의 `edd`를 가져오는 것으로 인덱싱 확인. 40개 로컬 로버스트 -> 40/40 feasible, 0 크래시. `experiment/priority-rule-restart-cycle` -> main merge.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
