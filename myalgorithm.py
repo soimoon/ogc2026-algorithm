@@ -116,14 +116,38 @@ _RESTART_MIN_BUDGET = 10.0
 # budget or a stall limit is hit), so this is rarely the binding constraint.
 _RESTART_MAX_ATTEMPTS = 5
 
+# 2026-07-22 (user-proposed): which Phase-1 priority_rule each restart
+# attempt uses, cycled by attempt index (not just varying `seed` on a fixed
+# rule, as before). Motivation: EDD doesn't always win locally (see
+# baseline_greedy.greedyalgorithm's priority_rule docstring) -- on the
+# instances it loses, a structurally different construction (not just a
+# differently-shuffled EDD order) may give Phase 3 a genuinely better basin
+# to improve on.
+#
+# Weighted heavily toward EDD (3 of 5 slots), not an even split, based on a
+# fresh 40-instance re-measurement the same day: EDD now wins 29-33/40
+# (stronger than the older 21/40 figure -- today's other fixes seem to have
+# widened EDD's lead, likely because the downstream repair/improve machinery
+# increasingly compensates for construction-order choices either way).
+# "area"/"area_slack" win only 5-6/40 each, and when they LOSE they often
+# lose catastrophically (10x-800x worse than EDD on several instances) --
+# since _iterated_greedy only ever keeps the strictly-better result, a bad
+# attempt is harmless to the final answer, but IS a wasted restart slot.
+# EDD gets attempts 1-3 unconditionally (so an instance that only fits 1-3
+# restarts -- likely large/slow instances, the ones already stuck across
+# submissions -- sees IDENTICAL behaviour to before this change); the
+# diversified rules only get tried on attempts 4-5, i.e. only when there's
+# genuine spare restart budget left over, which is exactly when trying
+# something with a lower average win rate costs nothing to attempt.
+_PRIORITY_RULE_CYCLE = ["edd", "edd", "edd", "area_slack", "area"]
+
 
 def _iterated_greedy(prob_info, baseline_greedy, check_feasibility, deadline: float):
     """
     Iterated-greedy diversification: call baseline_greedy.greedyalgorithm
-    repeatedly, each time with a different seed (so Phase 3's ALNS explores
-    a different sequence of destroy/rebuild decisions -- see
-    baseline_greedy.greedyalgorithm's seed docstring) and whatever time
-    budget remains, keeping the best feasible result seen.
+    repeatedly, each time with a different seed AND (2026-07-22) a different
+    Phase-1 priority_rule (see _PRIORITY_RULE_CYCLE above), with whatever
+    time budget remains, keeping the best feasible result seen.
 
     Motivation: a single greedyalgorithm() call can plateau (Phase 3 stalls
     out -- see baseline_greedy._improve's stall_limit) well before its time
@@ -133,7 +157,10 @@ def _iterated_greedy(prob_info, baseline_greedy, check_feasibility, deadline: fl
     A fresh construction/ALNS run from a different random seed is a
     different starting basin for local search and can find improvements
     the stalled run couldn't -- this is complementary to Phase 3's
-    within-run local search, not a replacement for it.
+    within-run local search, not a replacement for it. Varying the priority
+    rule too (not just the seed) goes further: a different seed still
+    perturbs the SAME EDD-based order, while a different rule gives Phase 3
+    a structurally different construction to improve on.
 
     Naturally self-limiting: each attempt is given only the time actually
     left (deadline - now), so on instances where a single attempt already
@@ -154,20 +181,22 @@ def _iterated_greedy(prob_info, baseline_greedy, check_feasibility, deadline: fl
             break
         attempt += 1
         seed = attempt - 1  # 0, 1, 2, ... -- deterministic across identical runs
-        candidate = baseline_greedy.greedyalgorithm(prob_info, timelimit=remaining, seed=seed)
+        rule = _PRIORITY_RULE_CYCLE[(attempt - 1) % len(_PRIORITY_RULE_CYCLE)]
+        candidate = baseline_greedy.greedyalgorithm(prob_info, timelimit=remaining, seed=seed,
+                                                     priority_rule=rule)
         result = check_feasibility(prob_info, candidate)
         if not result["feasible"]:
-            print(f"[algorithm] restart {attempt} (seed={seed}): infeasible "
+            print(f"[algorithm] restart {attempt} (seed={seed}, rule={rule}): infeasible "
                   f"(stage={result['stage']}) -- discarded.")
             continue
         objective = result["objective"]
         if best_objective is None or objective < best_objective:
-            print(f"[algorithm] restart {attempt} (seed={seed}): NEW BEST "
+            print(f"[algorithm] restart {attempt} (seed={seed}, rule={rule}): NEW BEST "
                   f"objective={objective:.0f}"
                   + (f" (was {best_objective:.0f})" if best_objective is not None else ""))
             best_solution, best_objective = candidate, objective
         else:
-            print(f"[algorithm] restart {attempt} (seed={seed}): "
+            print(f"[algorithm] restart {attempt} (seed={seed}, rule={rule}): "
                   f"objective={objective:.0f} (best stays {best_objective:.0f})")
 
     return best_solution, best_objective, attempt
