@@ -40,6 +40,22 @@ from baseline_greedy import _block_bbox, _placement_score
 from baseline_greedy import _top_candidates_for_block as _candidates_for_block
 from utils import Bay, Block, check_collisions, check_entry, check_exit
 
+# 2026-07-22: batches at or below this size get each other's current
+# position cross-injected into their candidate pools (see
+# _cross_position_candidate) -- see reinsert()'s call site for why this is
+# capped (O(K^2) extra cost, not needed for wholebay's much larger K).
+CROSS_INJECT_MAX_K = 5
+# 2026-07-22 (user-proposed): skip cross-injecting bi into bj's spot when
+# bi's own AABB is more than this much larger than bj's in either axis --
+# a cheap, deliberately generous pre-filter (not a correctness gate; the
+# real polygon check still happens downstream) to avoid paying for a
+# candidate/MIP-variable that's almost certainly going to be geometrically
+# hopeless anyway (e.g. injecting a large block into a much smaller one's
+# footprint). Generous on purpose: false negatives here only cost a missed
+# optimization opportunity, never correctness, so err toward not filtering
+# out genuinely-plausible swaps.
+CROSS_INJECT_SIZE_SLACK = 1.3
+
 
 def _time_overlaps(a0: float, a1: float, b0: float, b1: float) -> bool:
     return a0 < b1 and b0 < a1
@@ -67,6 +83,60 @@ def _current_position_candidate(bi: int, blk_data: dict, current_pos: tuple,
         top_y=cy + blk_bb[3],
     )
     return (score, bay_id, cx, cy, oi, entry, exit_t)
+
+
+def _cross_position_candidate(bi: int, blk_data: dict, my_orient_idx: int,
+                              other_pos: tuple, bay_loads: list[float],
+                              bay_weights: list[float],
+                              w1: float, w2: float, w3: float) -> tuple:
+    """
+    2026-07-22 (user-proposed). Score block bi occupying a DIFFERENT block's
+    current (bay_id, x, y) -- bi's own orientation/shape/processing_time,
+    the other block's position and entry time as a starting guess -- as a
+    candidate tuple, same format as _current_position_candidate.
+
+    Motivation: on a congested instance, Z1 tardiness caused by two blocks
+    mutually blocking each other's spot ("deadlock") can only be resolved by
+    literally swapping their positions -- but each block's own candidate
+    list is independently ranked and capped (max_per_block, usually 20), so
+    the OTHER block's exact spot may simply never be ranked highly enough to
+    survive the cap on its own merits, even though "swap" specifically
+    selects these two blocks BECAUSE they're blocking each other. Without
+    that spot in the pool, the joint MIP structurally cannot express the
+    swap at all, no matter how obviously good it would be. Injecting it
+    explicitly guarantees the solver always gets to at least CONSIDER the
+    literal swap, whether or not the AABB-lower-bound ranking would have
+    surfaced it.
+
+    Deliberately cheap (no _find_earliest_slot search) -- like every other
+    candidate in this codebase, this is just a suggestion; the pairwise
+    conflict check still screens it against the rest of this batch, and the
+    caller re-validates the whole trial with the real check_feasibility
+    before ever accepting it. Uses bi's OWN orientation (not the other
+    block's) since a different block's shape at that orientation index may
+    not even correspond to a compatible orientation for bi -- and the other
+    block's entry time as a starting guess (the natural "swap" hypothesis:
+    each block takes over where the other one was, when it was there),
+    combined with bi's own processing_time for the exit.
+    """
+    other_bay_id, other_cx, other_cy, _other_oi, other_entry, _other_exit = other_pos
+    r_time = blk_data["release_time"]
+    due = blk_data["due_date"]
+    proc = blk_data["processing_time"]
+    workload = blk_data["workload"]
+    prefs = blk_data["bay_preferences"]
+    s_max = max(prefs)
+    blk_bb = _block_bbox(blk_data, my_orient_idx)
+
+    entry = max(r_time, other_entry)
+    exit_t = entry + proc
+    tardiness = max(0.0, exit_t - due)
+    score = _placement_score(
+        tardiness, workload, bay_loads, other_bay_id,
+        s_max - prefs[other_bay_id], bay_weights, w1, w2, w3,
+        top_y=other_cy + blk_bb[3],
+    )
+    return (score, other_bay_id, other_cx, other_cy, my_orient_idx, entry, exit_t)
 
 
 def _crane_conflict(bay: Bay,
@@ -196,11 +266,39 @@ def reinsert(remove_ids: list[int],
                 print(f"[xpress_reinsert] DEBUG bail: deadline hit before candidates for block {bi} "
                       f"(remaining={remove_ids})")
                 return None
-            cands = _candidates_for_block(
-                bi, blocks_data[bi], bays, bay_placed, bay_schedule, bay_loads,
-                w1, w2, w3, bay_weights, max_per_block, deadline,
-                restrict_bay_id=restrict_bay_id,
-            )
+            # 2026-07-22: same-bay-first fast path. The general (non-wholebay)
+            # call path here always searched every bay x orientation for
+            # every block, even though most repair batches exist because the
+            # block's OWN current bay is contested (see this function's
+            # docstring on why max_per_block was raised) -- on a congested
+            # bay this full all-bays scan measured as the dominant cost of a
+            # repair round (6+ seconds for a 2-3 block batch, see
+            # notes/algorithm_overview.md). If the block's current bay alone
+            # already yields a full max_per_block quota of candidates (via
+            # the same AABB-lower-bound ranking used everywhere else), that
+            # bay is not sparse -- scanning the other bays too is very
+            # unlikely to change the outcome, so skip it. If the current bay
+            # comes up short (sparse/contested-out), fall through to the
+            # unrestricted full search exactly as before -- this never
+            # narrows the search in the case that actually needs it (a block
+            # whose current bay genuinely has no good options left), only in
+            # the case where its current bay already has plenty.
+            cands = None
+            if restrict_bay_id is None and current_positions is not None and bi in current_positions:
+                own_bay = current_positions[bi][0]
+                same_bay_cands = _candidates_for_block(
+                    bi, blocks_data[bi], bays, bay_placed, bay_schedule, bay_loads,
+                    w1, w2, w3, bay_weights, max_per_block, deadline,
+                    restrict_bay_id=own_bay,
+                )
+                if len(same_bay_cands) >= max_per_block:
+                    cands = same_bay_cands
+            if cands is None:
+                cands = _candidates_for_block(
+                    bi, blocks_data[bi], bays, bay_placed, bay_schedule, bay_loads,
+                    w1, w2, w3, bay_weights, max_per_block, deadline,
+                    restrict_bay_id=restrict_bay_id,
+                )
             if current_positions is not None and bi in current_positions:
                 current_cand = _current_position_candidate(
                     bi, blocks_data[bi], current_positions[bi],
@@ -211,6 +309,44 @@ def reinsert(remove_ids: list[int],
                 )
                 if not already_present:
                     cands = cands + [current_cand]
+            # 2026-07-22 (user-proposed): also inject each OTHER batch
+            # member's current position as a candidate for bi -- see
+            # _cross_position_candidate's docstring. Gated to small batches
+            # (CROSS_INJECT_MAX_K) since this is O(K) extra candidates per
+            # block, O(K^2) for the whole batch -- fine for "swap" (always
+            # exactly K=2) and other small-k operators, but would add
+            # needless cost to wholebay's much larger batches (K up to
+            # ~170), which already has its own current_positions-based
+            # fallback guarantee (_current_position_candidate above) and
+            # doesn't need this cross-injection to make progress.
+            if (current_positions is not None and bi in current_positions
+                    and len(remove_ids) <= CROSS_INJECT_MAX_K):
+                my_orient_idx = current_positions[bi][3]
+                my_bb = _block_bbox(blocks_data[bi], my_orient_idx)
+                my_w, my_h = my_bb[2] - my_bb[0], my_bb[3] - my_bb[1]
+                for bj in remove_ids:
+                    if bj == bi or bj not in current_positions:
+                        continue
+                    # cheap AABB size pre-filter (user-proposed) -- skip
+                    # injecting bi into bj's spot when bi's own footprint is
+                    # clearly too big to plausibly fit there, before paying
+                    # for the candidate/MIP-variable at all.
+                    other_orient_idx = current_positions[bj][3]
+                    other_bb = _block_bbox(blocks_data[bj], other_orient_idx)
+                    other_w = other_bb[2] - other_bb[0]
+                    other_h = other_bb[3] - other_bb[1]
+                    if (my_w > other_w * CROSS_INJECT_SIZE_SLACK
+                            or my_h > other_h * CROSS_INJECT_SIZE_SLACK):
+                        continue
+                    cross_cand = _cross_position_candidate(
+                        bi, blocks_data[bi], my_orient_idx, current_positions[bj],
+                        bay_loads, bay_weights, w1, w2, w3,
+                    )
+                    already_present = any(
+                        c[1:] == cross_cand[1:] for c in cands
+                    )
+                    if not already_present:
+                        cands = cands + [cross_cand]
             if not cands:
                 print(f"[xpress_reinsert] DEBUG bail: block {bi} has 0 candidates "
                       f"(batch={remove_ids})")
