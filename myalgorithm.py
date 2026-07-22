@@ -61,7 +61,34 @@ def _solve(prob_info: dict, timelimit: float, t_start: float) -> dict:
         # below and, if needed, the emergency fallback -- both are cheap,
         # but the server's hardware/load may differ from dev, so don't cut
         # this margin too thin.
-        inner_timelimit = max(1.0, timelimit * 0.9)
+        #
+        # 2026-07-22 (user-proposed, "measured-based dynamic reserve"): the
+        # fixed 10% below was tuned watching dev-machine timings on
+        # instances up to a few hundred blocks. utils.check_feasibility's
+        # own cost scales with instance size (profiling
+        # combined_stress_3400, 2026-07-22: ~2.2s for 3400 blocks =~
+        # 0.00065s/block on the dev machine) -- a hidden instance large
+        # enough, or a grading server slow enough, could make a single
+        # check_feasibility call alone eat more than 10% of timelimit,
+        # which is exactly what this margin exists to protect against.
+        # Reserve whichever is larger: the original fixed 10%, or an
+        # instance-size-derived estimate (doubled from the measured
+        # dev-machine rate, to hedge against an unverified, possibly
+        # slower, server) times a small multiplier for the handful of more
+        # check_feasibility-equivalent calls still to come after this point
+        # (Phase 2.5/2.6's post-sweep verification, _improve's final
+        # confirmation). Purely additive safety via max() -- never smaller
+        # than the original 10%, so no behaviour change on any instance
+        # where the estimate stays below it (true for all 40 local
+        # instances; largest is 300 blocks, estimate ~1.2s vs. a typical
+        # local timelimit's 10% floor of several seconds).
+        _EST_CHECK_FEASIBILITY_SEC_PER_BLOCK = 0.0013
+        _CHECK_FEASIBILITY_RESERVE_MULTIPLIER = 3
+        n_blocks = len(prob_info.get("blocks", []))
+        estimated_reserve = (_EST_CHECK_FEASIBILITY_SEC_PER_BLOCK * n_blocks
+                             * _CHECK_FEASIBILITY_RESERVE_MULTIPLIER)
+        reserve = max(timelimit * 0.1, estimated_reserve)
+        inner_timelimit = max(1.0, timelimit - reserve)
         best_solution, best_objective, n_attempts = _iterated_greedy(
             prob_info, baseline_greedy, check_feasibility,
             deadline=t_start + inner_timelimit,

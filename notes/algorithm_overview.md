@@ -365,6 +365,11 @@
     `_place_blocks`의 overtime 메커니즘(#58)이 여전히 `scan_budget = OVERTIME_SCAN_CAP if in_overtime else CANDIDATE_SCAN_CAP`라는 **두 값짜리 이진 전환**이었음 -- `deadline` 넘기 직전 블록은 여전히 CANDIDATE_SCAN_CAP(50) 전체를, 넘긴 직후 블록은 갑자기 OVERTIME_SCAN_CAP(5)만 받아서 "같은 cliff가 한 단계 아래에서 재발"하는 구조. 사용자 제안: `time_left_ratio = (hard_deadline - now) / (hard_deadline - phase_start)` 기반으로 `scan_budget`을 `base_cap`에서 `floor_cap`까지 선형으로 연속 감소시키는 `_dynamic_scan_cap()` 헬퍼 신설. 별도의 처리량 벤치마크 없이도 "느린 기계일수록 블록당 경과시간이 더 빨리 누적 -> ratio가 더 빨리 줄어듦"이라는 방식으로 자연스럽게 기계 속도에 맞춰짐(자가보정 효과를 부작용으로 얻음).
     **검증**: x16(4000블록) 스트레스 인스턴스 3회 반복 -> 전부 feasible, elapsed 63.2~63.8s(60s 예산 대비 일관된 오버런, 이전 그래프에이션 수정 이후 수준과 동등하거나 더 좋음). 40개 로컬 인스턴스 20초 로버스트 테스트 -> 40/40 feasible, 0 크래시. `experiment/dynamic-scan-cap` 브랜치에서 main으로 merge.
 
+65. **시간 기반 아키텍처 안정성 재검토 3단계: `myalgorithm._solve`의 최종 안전마진을 인스턴스 크기 기반 측정치로 (사용자 제안, 2026-07-22)**
+    `inner_timelimit = timelimit * 0.9`(check_feasibility 최종 검증 + emergency fallback을 위한 고정 10% 예약)가 몇백 블록짜리 로컬 인스턴스 기준으로 튜닝된 값이었는데, `check_feasibility` 자체 비용이 인스턴스 크기에 비례한다는 걸 오늘(#62) 프로파일링으로 이미 확인함(combined_stress_3400: ~2.2s/3400블록 =~ 0.00065s/블록). 숨겨진 P4-6이 충분히 크거나 서버가 느리면 `check_feasibility` 단 한 번 호출이 10% 예약분을 넘길 수 있음 -- 정확히 이 마진이 지키려는 것. **수정**: `reserve = max(timelimit*0.1, 0.0013(=측정치 2배, 서버 속도 불확실성 헤지) * n_blocks * 3(=이후 남은 check_feasibility급 호출 수))`로, 기존 고정 10%보다 작아지는 일은 없는 순수 가산 방식(`max()`). 로컬 40개 인스턴스(최대 300블록)에서는 추정치가 항상 고정 10% 아래라 동작 변화 없음, 3400+블록 규모에서는 추정치가 지배적이 됨.
+    **범위 결정**: `_repair`의 78%/95% 임계값에는 같은 공식을 적용하지 않음 -- 그 마진은 `check_feasibility`가 아니라 최종 guarantee 단계의 강제배치(`_force_place`) 비용을 위한 것이라 다른 연산이고, `_force_place`는 이미 O(1)에 가깝게 고쳐져 있어(오늘 #59) 진짜 변수는 "몇 개가 강제배치될지"인데 이건 사전에 계측 불가능 -- 근거 없이 같은 숫자를 끌어다 쓰면 실제보다 엄밀한 것처럼 보이는 것뿐이라 판단, 손대지 않음.
+    **검증**: x16/combined_stress_3400 각 3회 반복 -> 전부 feasible이고, elapsed가 이전(60s 예산에서 63~64s로 초과하던 수준)보다 **명확히 개선**되어 53.9~55.4s(x16)/51.1~51.9s(combined_3400)로 예산 안에 안전하게 들어옴 -- 더 큰 예약분 덕에 실제 마진이 커진 것으로 해석. objective는 이전 수준과 동등(품질 손실 미미). 40개 로컬 인스턴스 20초 로버스트 테스트 -> 40/40 feasible, 0 크래시. `experiment/measured-safety-margin` 브랜치에서 main으로 merge.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
