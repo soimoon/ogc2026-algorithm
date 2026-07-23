@@ -468,6 +468,87 @@
     **검증**: 재현 스크립트로 직접 확인(수정 후 `blocked_by_existing=True`로 올바르게 걸러짐), `equiv_cpsat_vs_xpress.py`(prob_1/20/39, 30개 시나리오)로 INFEASIBLE-MISMATCH 0건 확인(수정 전 2건 -> 0건, 남은 8건은 전부 benign한 OBJ-MISMATCH), 40개 로컬 로버스트 40/40. `experiment/reinsert-candidate-existing-block-safety` -> main merge.
     **다음 단계**: K=25/50/100+ 스케일링 실측(Xpress vs CP-SAT interleaved)으로 복귀.
 
+78. **9차 제출 준비 시작 -- 사용자가 직접 코드 3개 파일(myalgorithm.py/baseline_greedy.py/xpress_reinsert.py)을
+    라인 단위로 재검토 요청, 문서 대조 없이 코드 자체에서 버그 2건 발견/수정 (2026-07-24)**
+    **배경**: 마크다운 문서(특히 `algorithm_overview2.md` 스냅샷)에 오탈자/누락이 있을 수 있으니, 문서를
+    참고하지 말고 코드 자체를 직접 읽어서 구조와 문제점을 파악해달라는 요청. `myalgorithm.py` 전체,
+    `baseline_greedy.py` 전체(5157줄), `xpress_reinsert.py` 전체를 라인 단위로 읽고 대조.
+    **발견 1 (문서 최신성)**: `algorithm_overview2.md` §3.1이 `priority_rule`을 `edd`/`atc`/`slack`/`regret`로만
+    설명하는데, 실제로는 2026-07-22에 추가된 `area`/`area_slack`이 있고 `myalgorithm.py`의
+    `_PRIORITY_RULE_CYCLE = ["edd","edd","edd","area_slack","area"]`가 재시작 시도 4~5에서 실제로 사용 중 --
+    스냅샷 문서가 실제 재시작 로직의 일부를 반영 못 하고 있었음.
+    **발견 2 (실제 버그, `cpsat_reinsert.py`)**: `#77`에서 `xpress_reinsert.py`에 적용한 존재-블록 안전성
+    수정(`_cross_candidate_blocked_by_existing`)이 같은 세션에 작성된 `cpsat_reinsert.py`(git 미추적,
+    `#76`/`#77` 논의 당시 프로토타입)에는 이식돼 있지 않았음을 코드 대조로 발견 -- `_current_position_candidate`
+    주입이 배치 밖 기존 점유 블록과 전혀 충돌 검사를 안 하는, `#77`에서 이미 재현/수정했던 것과 **동일한
+    버그**가 그대로 남아있었음. `cpsat_reinsert.py`가 아직 어디서도 import 안 돼 실채점 영향은 없었지만,
+    다음 세션에 이 모듈을 실제로 배선하기 전 반드시 고쳐야 하는 회귀였음.
+    **발견 3 (실제 버그, `baseline_greedy.py._repair`)**: `_repair`의 강제배치(force-place) 경로 2곳이
+    `_force_place`의 `sorted_cache` 최적화(2026-07-22, Phase 1 overtime 구간의 O(n²) 스파이럴을 고치려고
+    도입됐던 것과 동일한 메커니즘)를 안 쓰고 있었음 -- (a) "이번 패스 시도가 위반을 못 줄였을 때 to_repair
+    전체를 강제배치"하는 폴백(`hard_deadline`을 안 넘겨서 `_place_blocks`의 `past_hard_deadline` 게이트가
+    한 번도 안 열림), (b) repair 루프 전체가 끝난 뒤 "최종 feasibility 보장" 단계의 강제배치 루프
+    (`_force_place`를 직접 호출하면서 `sorted_cache` 인자 자체를 안 넘김). 둘 다 Phase 1 overtime에서
+    이미 한 번 진단/수정됐던 것과 정확히 같은 "자기강화 O(n²) 스캔" 패턴이 남아있던 것 -- 로컬 40개에선
+    이 단계까지 남는 위반이 적어 체감 못 했지만, 아직 못 본 크고 혼잡한 히든 인스턴스에서 이 단계까지
+    수백~수천 개 위반이 밀리면 TLE로 이어질 수 있는 잠재 위험이었음.
+    **수정**: (2) `cpsat_reinsert.py`에 `_cross_candidate_blocked_by_existing()`을 이식하고
+    `_current_position_candidate` 주입 지점에 적용, 모듈 docstring의 낙관적 안전성 주장도 정정. (3-a)
+    `to_repair` 전체 강제배치 폴백 호출에 `hard_deadline=t_start`(항상 이미 과거 시각)를 넘겨서
+    `past_hard_deadline`이 호출 즉시 참이 되도록 함 -- 이 호출은 애초에 전원이 `forced_ids`라 검색 단계가
+    전혀 없으므로 캐시를 처음부터 켜도 안전. (3-b) 최종 guarantee 루프에 자체 `sorted_cache` 딕셔너리를
+    만들어 매 `_force_place` 호출에 넘김.
+    **검증**: 두 파일 모두 `python -c "import ..."`로 구문/참조 오류 없음 확인. `_aabb_gap_entry`
+    docstring이 "캐시 유무와 무관하게 정확히 같은 값을 반환"한다고 이미 명시하고 있어(순수 성능 최적화,
+    의사결정 로직 불변) 리스크가 낮은 수정으로 판단 -- 그래도 로컬 40개 인스턴스(train 20 + train-set2 20)
+    전체를 20초 예산으로 로버스트니스 재검증, 40/40 feasible/no-crash/no-timeout 확인.
+    **후속**: 9차 제출 준비 사이클부터는 스냅샷 문서를 `algorithm_overview2.md` 하나를 계속 덮어쓰는 대신
+    `notes/algorithm_overview_v9.md`처럼 제출 사이클별로 새 버전 파일을 만들어 이전 스냅샷을 보존하기로 함
+    (`algorithm_overview2.md`는 8차 제출 시점 스냅샷으로 그대로 둠). 이 파일(`algorithm_overview.md`)의
+    날짜별 append 규칙은 그대로 유지.
+
+79. **CP-SAT 재작성(정확하지만 이득 없음), 그리드 사전필터(미미), 전역 기하 캐시(확실한 이득) -- 사용자와의
+    설계 논의 3연속을 실측으로 정리 (2026-07-24)**
+    **배경**: `#78` 이후 "CP-SAT이 이론적으로 이 문제(불규칙 크레인 스케줄링)에 Xpress보다 나은가"를 논의.
+    시간을 CP-SAT interval var로 풀면 static 후보 timing 병목을 해소할 수 있다는 가설을 세우고, 먼저
+    `analysis/time_diversity_probe.py`로 "Xpress에 timing 후보만 3배 늘려도" K=6 hot cluster에서 -95~99%
+    개선을 확인 -- 그런데 이 실험은 heaviest bay를 통째로 비운 세팅이라, 사용자 지적대로 재검증하니(같은
+    K=6, 나머지 bay 블록을 ambient로 제대로 남김) xpress vs cpsat 개선폭이 **0%로 사라짐**. 즉 처음 결과는
+    실제 소규모(tardy/swap 등) reinsert() 상황이 아니라 wholebay(bay 전체 비움)에 해당하는 비현실적 세팅
+    이었음이 드러남.
+    **CP-SAT interval-var + NoOverlap 전면 재작성**: `_static_conflict()`(check_collisions/check_entry
+    양방향, 시간 무관 정적 사실)와 `AddNoOverlap` 페어당 하나씩(공유 그룹 아님, 다른 후보끼리 잘못 배타적이
+    되는 것 방지)으로 구현. 정확성은 합성 테스트 2건 + 실제 인스턴스에서 전부 확인. **실측 결과**: 소규모
+    K=6(ambient 포함, 현실적)에서 xpress와 사실상 동일(개선 0%); wholebay K=46에서 objective는 완전히
+    같으면서 **cpsat이 25배 느림**(1.2s vs 31.1s) -- 위치 조합(assignment-with-conflicts)이라는 이 문제의
+    진짜 어려운 부분은 Xpress의 LP relaxation/clique cut이 유리한 영역이고, CP-SAT의 NoOverlap은 시간
+    축에만 도움을 주는데 이 시나리오에선 시간이 병목이 아니었음. K=165에서는 cpsat의 grid-cell 안쪽
+    이중루프에 deadline 체크가 없어 179초까지 초과하는 버그도 발견/수정(셀 단위 체크를 셀 안쪽까지 확장).
+    **결론**: 모델은 정확하지만 테스트한 두 스케일 어디서도 순이득을 못 봐서 배선 보류, 코드만 유지.
+    **정공법으로 전환 -- Xpress 자체의 K 스케일링 개선**: 사용자가 두 가지 레버 제안 -- (a) 그리드 기반
+    AABB 사전필터로 쌍별 루프 자체를 O(n)에 가깝게, (b) K 반비례 동적 후보 할당. (a)부터 시도:
+    `baseline_greedy.bucket_candidate_pairs_by_grid()`를 신설해서 `xpress_reinsert.py`/`cpsat_reinsert.py`
+    둘 다 공용으로 쓰도록 이식. **OLD/NEW 쌍별 충돌 집합 완전 일치 검증**(`analysis/
+    xpress_reinsert_grid_equivalence.py`, K=6/20/46/100, 전부 MATCH) 통과했지만, **성능은 K=100에서만
+    1.8배(199.5s→111.7s), 그 이하에서는 거의 차이 없거나 K=46에서 오히려 소폭 느림** -- 이 문제의 후보들이
+    실제로는 공간적으로 많이 뭉쳐 있어서(경합 bay라서) 그리드가 거를 "먼 쌍" 자체가 적었기 때문. 정확성은
+    확실하고 큰 K에서 손해는 없어 반영은 유지.
+    **전역 기하 사실 캐시 (사용자 제안, 오늘의 가장 확실한 win)**: 그리드 필터로도 못 줄인 진짜 병목
+    ("가까운 쌍 자체가 워낙 많다")을 겨냥. `check_collisions`/`check_entry` 결과가 두 블록의 고정 위치만의
+    함수(시간·다른 블록 상태 무관)라는 사실을 이용해 `_cached_geometry_facts()`로 결과를 메모이즈,
+    `_crane_conflict_from_facts()`로 캐시된 사실 + 실제 라운드 시간만으로 순수 비교(Shapely 호출 없음).
+    **안전장치**: 캐시를 모듈 전역이 아니라 `greedyalgorithm()` 호출마다 새로 만들어서 `_repair`/`_improve`로
+    명시적으로 전달 -- `analysis/robustness_check.py`처럼 한 프로세스에서 여러 인스턴스를 도는 호출자에서
+    인스턴스 간 캐시 오염이 구조적으로 불가능하도록(bay_id/block_id 정수만으로는 인스턴스를 구분 못 하므로
+    `id(bays)` 같은 객체 identity도 안전하지 않다고 판단, 명시적 스코프 전달만 채택). **검증**: 같은 배치
+    5회 반복 호출이 캐시 유무와 무관하게 완전히 동일한 결과(정확성), 속도는 1.85배(6.72s→3.63s); 실제
+    `_improve()` 60초급 실행에서도 같은 objective 도달하며 1.84배 빠름(18.8s→10.2s).
+    **최종 40개 로버스트니스**: 그리드 필터+기하 캐시 반영 후 재검증에서 첫 실행이 "2건 시간 초과(최대
+    3.9초)"를 보고했으나, 여러 백그라운드 검증을 동시에 돌리던 상태였던 걸 확인 -- 조용한 상태로 재실행하니
+    40/40 feasible, 0 crash, **0 시간 초과**로 재현 안 됨(기존에 알려진 벽시계-의존적 노이즈, §9.2와 일치).
+    **다음 단계**: (b) K 반비례 동적 후보 할당은 후보 다양성/품질 트레이드오프가 있어 별도 검증 필요,
+    아직 미착수. `notes/algorithm_overview_v9.md` §7/§7.5/§9에 오늘 전체 결과 반영.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들

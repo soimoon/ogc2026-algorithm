@@ -49,13 +49,31 @@ bad result. reinsert() returns None on any failure (Xpress not
 importable/licensed, no candidates, solve infeasible/timed out); callers
 must fall back to the existing greedy _place_blocks reinsertion in that
 case, never treat this as the only path.
+
+2026-07-24 (user-proposed, following today's cpsat_reinsert.py measurements):
+the pairwise conflict-discovery loop below used to be a naive
+O(K^2 x candidates^2) double-nested iteration over every block-pair x
+candidate-pair combination, regardless of how far apart two candidates
+actually are -- explicitly called out as "wholebay's long-documented
+scaling ceiling" in this module's own history (see
+notes/algorithm_overview.md). cpsat_reinsert.py's 2026-07-23 draft had
+already solved the identical sub-problem (grid-bucket candidates by AABB,
+only compare pairs sharing a cell) for ITS OWN pairwise loop -- extracted
+into baseline_greedy.bucket_candidate_pairs_by_grid() so this module
+reuses the same fix instead of duplicating it. This ONLY narrows which
+candidate pairs get the expensive _time_overlaps/_bb_overlap/geometry
+checks run on them at all -- every check downstream of that narrowing is
+byte-for-byte the same as before this change (see
+analysis/xpress_reinsert_grid_equivalence.py, which confirms the OLD
+naive loop and the NEW grid-narrowed loop produce IDENTICAL conflict
+constraint sets on real batches before this was trusted).
 """
 
 from __future__ import annotations
 
 import time
 
-from baseline_greedy import _block_bbox, _placement_score
+from baseline_greedy import _block_bbox, _placement_score, bucket_candidate_pairs_by_grid
 from baseline_greedy import _top_candidates_for_block as _candidates_for_block
 from utils import Bay, Block, _bb_overlap, check_collisions, check_entry, check_exit
 
@@ -235,6 +253,88 @@ def _crane_conflict(bay: Bay,
     return False
 
 
+def _crane_conflict_from_facts(entry_i: float, exit_i: float, entry_j: float, exit_j: float,
+                               i_blocks_j: bool, j_blocks_i: bool) -> bool:
+    """
+    Pure time-comparison restatement of _crane_conflict's four boundary
+    conditions, given the two ALREADY-KNOWN (position-only, time-
+    independent) geometry facts -- no Shapely calls here at all.
+
+    2026-07-24 (user-proposed): check_exit(bay,[B],X)'s geometry is
+    IDENTICAL to check_entry(bay,[B],X)'s (see _crane_conflict's own
+    docstring/this module's history -- "the j >= k rule applies in both
+    directions"), so conditions 1&3 both only ever need j_blocks_i
+    (= check_entry(bay,[blk_j],blk_i)) and conditions 2&4 both only ever
+    need i_blocks_j (= check_entry(bay,[blk_i],blk_j)) -- exactly the two
+    facts _cached_geometry_facts() computes once and reuses across every
+    round of an ALNS run that happens to re-propose the same two
+    positions. Kept as a separate function (not inlined into the caller)
+    so it stays trivially unit-testable/comparable against the original
+    Shapely-calling `_crane_conflict` above.
+    """
+    if entry_j < entry_i < exit_j and j_blocks_i:
+        return True
+    if entry_i < entry_j < exit_i and i_blocks_j:
+        return True
+    if entry_j < exit_i < exit_j and j_blocks_i:
+        return True
+    if entry_i < exit_j < exit_i and i_blocks_j:
+        return True
+    return False
+
+
+def _cached_geometry_facts(cache: dict | None, bay_id: int, bay: Bay,
+                           blk_i: Block, key_i: tuple, blk_j: Block, key_j: tuple
+                           ) -> tuple[bool, bool, bool]:
+    """
+    Return (same_level_collision, i_blocks_j_entry, j_blocks_i_entry) for
+    this exact pair of FIXED positions -- a pure function of (bay_id, key_i,
+    key_j) alone (see this module's 2026-07-24 docstring section for the
+    algebraic argument), so safe to memoize across every reinsert() call
+    for the lifetime of a single `cache` dict.
+
+    key_i/key_j : (block_id, x, y, orient_idx) -- already computed by the
+        caller from its own loop variables, no extra work here. Used only
+        as a cache key, never reinterpreted.
+
+    cache=None disables memoization entirely (always recompute) -- the
+    safe default for any caller that hasn't opted in (see reinsert()'s
+    geometry_cache parameter docstring for why this must never be a bare
+    module-level global: a cache that outlives one greedyalgorithm() call
+    would silently answer for the WRONG problem instance in any process
+    that solves more than one, e.g. analysis/robustness_check.py).
+
+    Cache key is normalized (smaller key first) so (i, j) and (j, i) share
+    one entry; check_collisions is symmetric already, and the two
+    directional check_entry facts are stored/swapped consistently with
+    that normalization.
+    """
+    if key_i <= key_j:
+        a_key, b_key, blk_a, blk_b, swapped = key_i, key_j, blk_i, blk_j, False
+    else:
+        a_key, b_key, blk_a, blk_b, swapped = key_j, key_i, blk_j, blk_i, True
+
+    if cache is None:
+        same_level = bool(check_collisions(bay, [blk_a, blk_b]))
+        a_blocks_b = bool(check_entry(bay, [blk_a], blk_b, fast=True))
+        b_blocks_a = bool(check_entry(bay, [blk_b], blk_a, fast=True))
+    else:
+        cache_key = (bay_id, a_key, b_key)
+        facts = cache.get(cache_key)
+        if facts is None:
+            same_level = bool(check_collisions(bay, [blk_a, blk_b]))
+            a_blocks_b = bool(check_entry(bay, [blk_a], blk_b, fast=True))
+            b_blocks_a = bool(check_entry(bay, [blk_b], blk_a, fast=True))
+            facts = (same_level, a_blocks_b, b_blocks_a)
+            cache[cache_key] = facts
+        else:
+            same_level, a_blocks_b, b_blocks_a = facts
+
+    if not swapped:
+        return same_level, a_blocks_b, b_blocks_a  # (same_level, i_blocks_j, j_blocks_i)
+    return same_level, b_blocks_a, a_blocks_b  # i,j were swapped relative to a,b
+
+
 def _cross_candidate_blocked_by_existing(bay: Bay, blk: Block, entry: float, exit_t: float,
                                          existing_blocks: list[Block],
                                          existing_schedule: list[tuple[int, int]]) -> bool:
@@ -290,7 +390,8 @@ def reinsert(remove_ids: list[int],
             max_per_block: int = 20,
             solve_time_limit: int = 3,
             restrict_bay_id: int | None = None,
-            current_positions: dict[int, tuple] | None = None) -> dict[int, dict] | None:
+            current_positions: dict[int, tuple] | None = None,
+            geometry_cache: dict | None = None) -> dict[int, dict] | None:
     """
     Jointly reinsert remove_ids via a small Xpress MIP.
 
@@ -351,6 +452,23 @@ def reinsert(remove_ids: list[int],
         none of the independently-top-ranked combinations happened to be
         mutually compatible). None (default) -- no guarantee added, existing
         behaviour unchanged for every other caller.
+    geometry_cache : optional (2026-07-24, user-proposed), a plain dict used
+        to memoize _cached_geometry_facts() lookups across MULTIPLE calls to
+        this function -- see that function's docstring for why this is
+        provably safe to reuse (a pure function of fixed position pairs,
+        independent of timing or any other block's state). None (default,
+        used by every caller that hasn't opted in -- e.g. every analysis/
+        script) disables memoization entirely, identical to before this
+        parameter existed. Callers that DO opt in (baseline_greedy.
+        greedyalgorithm(), threaded through _repair/_improve) MUST create a
+        fresh dict once per greedyalgorithm() call and never let it outlive
+        that call or leak into a different problem instance's solve --
+        bay_id/block_id integers alone don't disambiguate between two
+        different instances that happen to reuse the same ids, so a stale
+        cache from a PREVIOUS instance would silently answer for the wrong
+        geometry in any process that solves more than one (e.g.
+        analysis/robustness_check.py's multi-instance loop). Never make this
+        a bare module-level global for exactly that reason.
     """
     try:
         import xpress as xp
@@ -519,31 +637,60 @@ def reinsert(remove_ids: list[int],
                 blk_bbs.append((cx + lx0, cy + ly0, cx + lx1, cy + ly1))
             bb[bi] = blk_bbs
 
+        # 2026-07-24: candidates grouped by bay, then narrowed to AABB-close
+        # pairs via the shared grid helper (see module docstring) instead of
+        # an unconditional O(K^2 x candidates^2) iteration over every
+        # block-pair x candidate-pair combination. Grouping by bay first
+        # means every returned pair is automatically same-bay -- no more
+        # explicit `bay_i != bay_j` check needed. Everything AFTER the
+        # narrowing (same-block skip, _time_overlaps, the real
+        # check_collisions/_crane_conflict check, the constraint itself) is
+        # byte-for-byte identical to before this change.
         ids = list(per_block.keys())
-        for a in range(len(ids)):
+        by_bay: dict[int, list[tuple[tuple[int, int], tuple[float, float, float, float]]]] = {}
+        for bi, cands in per_block.items():
+            for ci in range(len(cands)):
+                bay_id = cands[ci][1]
+                by_bay.setdefault(bay_id, []).append(((bi, ci), bb[bi][ci]))
+
+        for bay_id, entries in by_bay.items():
             if deadline is not None and time.time() > deadline:
                 return None
-            for b in range(a + 1, len(ids)):
-                bi, bj = ids[a], ids[b]
-                for ci, (_, bay_i, cx_i, cy_i, oi_i, entry_i, exit_i) in enumerate(per_block[bi]):
-                    for cj, (_, bay_j, cx_j, cy_j, oi_j, entry_j, exit_j) in enumerate(per_block[bj]):
-                        if (bay_i != bay_j or not _time_overlaps(entry_i, exit_i, entry_j, exit_j)
-                                or not _bb_overlap(bb[bi][ci], bb[bj][cj])):
-                            continue
-                        blk_i = Block(block_id=bi, block_data=blocks_data[bi],
-                                     x=cx_i, y=cy_i, orient_idx=oi_i)
-                        blk_j = Block(block_id=bj, block_data=blocks_data[bj],
-                                     x=cx_j, y=cy_j, orient_idx=oi_j)
-                        # Two reasons a (candidate_i, candidate_j) pair can't
-                        # coexist: steady-state spatial overlap (same-level
-                        # collision) OR a crane operation obstruction (one's
-                        # entry/exit swept-blocked by the other's same-or-
-                        # higher layers) -- these are different rules and
-                        # both need checking, not just the first.
-                        if (check_collisions(bays[bay_i], [blk_i, blk_j])
-                                or _crane_conflict(bays[bay_i], blk_i, entry_i, exit_i,
-                                                   blk_j, entry_j, exit_j)):
-                            prob.addConstraint(y[(bi, ci)] + y[(bj, cj)] <= 1)
+            close_pairs = bucket_candidate_pairs_by_grid(entries, deadline=deadline)
+            if close_pairs is None:
+                print(f"[xpress_reinsert] DEBUG bail: deadline hit during pairwise "
+                      f"construction (bay={bay_id})")
+                return None
+            for (bi, ci), (bj, cj) in close_pairs:
+                if bi == bj:
+                    continue  # same block's own candidates already mutually exclusive
+                _, bay_i, cx_i, cy_i, oi_i, entry_i, exit_i = per_block[bi][ci]
+                _, bay_j, cx_j, cy_j, oi_j, entry_j, exit_j = per_block[bj][cj]
+                if not _time_overlaps(entry_i, exit_i, entry_j, exit_j):
+                    continue
+                blk_i = Block(block_id=bi, block_data=blocks_data[bi],
+                             x=cx_i, y=cy_i, orient_idx=oi_i)
+                blk_j = Block(block_id=bj, block_data=blocks_data[bj],
+                             x=cx_j, y=cy_j, orient_idx=oi_j)
+                # 2026-07-24: same two reasons a (candidate_i, candidate_j)
+                # pair can't coexist as before (steady-state same-level
+                # collision, or a crane entry sweep obstruction in either
+                # direction) -- but the underlying Shapely-calling facts are
+                # now looked up through geometry_cache (see
+                # _cached_geometry_facts' docstring: both facts are a pure
+                # function of the two FIXED positions, independent of entry_i/
+                # exit_i/entry_j/exit_j, so memoizing them across every
+                # reinsert() call in one greedyalgorithm() run is provably
+                # safe). _crane_conflict_from_facts is a pure time-comparison
+                # restatement of the original _crane_conflict, given those
+                # cached facts -- no new Shapely calls anywhere in this branch.
+                same_level, i_blocks_j, j_blocks_i = _cached_geometry_facts(
+                    geometry_cache, bay_i, bays[bay_i],
+                    blk_i, (bi, cx_i, cy_i, oi_i), blk_j, (bj, cx_j, cy_j, oi_j),
+                )
+                if same_level or _crane_conflict_from_facts(
+                        entry_i, exit_i, entry_j, exit_j, i_blocks_j, j_blocks_i):
+                    prob.addConstraint(y[(bi, ci)] + y[(bj, cj)] <= 1)
 
         _t_pairs1 = time.time()
 

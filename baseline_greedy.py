@@ -552,6 +552,109 @@ def _rank_candidates_by_earliest_bound(
 
 
 # -----------------------------------------------------------------------------
+# Shared helper: grid-bucketed AABB-close pair discovery (2026-07-24)
+# -----------------------------------------------------------------------------
+
+_GRID_DEADLINE_CHECK_INTERVAL = 500
+
+
+def bucket_candidate_pairs_by_grid(
+    entries: list[tuple[object, tuple[float, float, float, float]]],
+    deadline: float | None = None,
+) -> list[tuple[object, object]] | None:
+    """
+    Given `entries` = [(key, world_aabb), ...] for candidates that all share
+    the SAME bay (callers must pre-group by bay -- conflicts only ever
+    happen within one bay), return every pair of keys whose AABBs are close
+    enough to be worth a real (Shapely-based) conflict check -- i.e. every
+    pair sharing at least one grid cell, each pair yielded exactly once.
+
+    deadline : optional absolute time.time() budget. Checked both BETWEEN
+        cells and periodically INSIDE a single cell's own O(m^2) inner pair
+        loop (every _GRID_DEADLINE_CHECK_INTERVAL pair comparisons) --
+        2026-07-24 bugfix, found re-verifying cpsat_reinsert.py's own first
+        cut of this logic at K=165 (wholebay scale): a between-cells-only
+        check is NOT frequent enough once candidates cluster heavily into
+        one or two cells (e.g. a just-emptied bay, where most position
+        candidates land near the same corner) -- a single pathologically
+        large cell's inner loop can itself run for a long time before the
+        NEXT cell (and its check) is ever reached. Returns None if the
+        deadline is hit before finishing (same "give up cleanly" contract
+        as every other deadline-aware function in this codebase) -- callers
+        must treat that exactly like any other None/failure return.
+
+    2026-07-24: extracted from cpsat_reinsert.py's reinsert() (written
+    2026-07-23 to make ITS pairwise-conflict discovery O(n) instead of
+    O(n^2) -- see that module's original docstring) so xpress_reinsert.py's
+    own pairwise loop, previously a naive O(K^2 x candidates^2) iteration
+    over every block-pair x candidate-pair combination regardless of how
+    far apart they are, can share the same fix instead of duplicating it.
+    `key` is caller-defined (xpress_reinsert.py uses (block_id, candidate_
+    index); cpsat_reinsert.py tags "cand" vs "amb" entries in its own key
+    tuples) -- this function only ever buckets/pairs by AABB, never
+    interprets `key` itself.
+
+    NOT a correctness gate by itself: cell size is a heuristic (median
+    candidate footprint dimension in this call, see below), so two AABBs
+    sharing a cell are NOT guaranteed to truly overlap (coarse boundary),
+    and this only pairs entries that DO overlap -- callers must always
+    re-confirm with the exact `_bb_overlap` test (and their own real
+    collision/crane checks) before treating a returned pair as an actual
+    conflict; this function's only job is narrowing which pairs are worth
+    that real check at all, exactly like the AABB pre-filter every
+    check_collisions/check_entry/check_exit call already does internally,
+    one level up.
+
+    Cell size: median of every entry's own width/height (falls back to 1.0
+    for a degenerate all-zero-size case) -- not tuned/validated against
+    pathological size distributions (e.g. one huge block among many tiny
+    ones still spans many cells), a reasonable default rather than a
+    guarantee (same caveat this heuristic already carried in
+    cpsat_reinsert.py).
+    """
+    n = len(entries)
+    if n < 2:
+        return []
+
+    dims = sorted(
+        v for (_key, (x0, y0, x1, y1)) in entries for v in (x1 - x0, y1 - y0) if v > 0
+    )
+    cell_size = max(dims[len(dims) // 2] if dims else 1.0, 1e-6)
+
+    cells: dict[tuple[int, int], list[int]] = {}
+    for i, (_key, (x0, y0, x1, y1)) in enumerate(entries):
+        cx0, cy0 = int(x0 // cell_size), int(y0 // cell_size)
+        cx1, cy1 = int(x1 // cell_size), int(y1 // cell_size)
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                cells.setdefault((cx, cy), []).append(i)
+
+    seen_pairs: set[tuple[int, int]] = set()
+    pairs: list[tuple[object, object]] = []
+    _comparisons = 0
+    for cell_idxs in cells.values():
+        if deadline is not None and time.time() > deadline:
+            return None
+        m = len(cell_idxs)
+        for ii in range(m):
+            a = cell_idxs[ii]
+            for jj in range(ii + 1, m):
+                _comparisons += 1
+                if (deadline is not None and _comparisons % _GRID_DEADLINE_CHECK_INTERVAL == 0
+                        and time.time() > deadline):
+                    return None
+                b = cell_idxs[jj]
+                pair = (a, b) if a < b else (b, a)
+                if pair in seen_pairs:
+                    continue  # candidates spanning >1 shared cell
+                seen_pairs.add(pair)
+                if not _bb_overlap(entries[a][1], entries[b][1]):
+                    continue  # grid cells are coarse -- confirm exact AABB overlap
+                pairs.append((entries[a][0], entries[b][0]))
+    return pairs
+
+
+# -----------------------------------------------------------------------------
 # Placement score (lower is better)
 # -----------------------------------------------------------------------------
 
@@ -1985,6 +2088,22 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     # large, e.g. 600s+?), not shrinking things further at the short end.
     xpress_max_per_block = 20
 
+    # 2026-07-24 (user-proposed): a single geometry-facts cache for the
+    # LIFETIME OF THIS greedyalgorithm() CALL ONLY -- see
+    # xpress_reinsert.reinsert()'s geometry_cache docstring for why
+    # check_collisions/check_entry results between two FIXED candidate
+    # positions are a pure, memoizable fact independent of when/which round
+    # asks. Created fresh here (never a bare module-level global) and
+    # threaded through every _repair/_improve call below, which in turn
+    # thread it into every xpress_reinsert.reinsert() call they make --
+    # this is the ONLY place it is ever constructed, so it is structurally
+    # impossible for one problem instance's geometry facts to leak into a
+    # different instance's solve (e.g. analysis/robustness_check.py's
+    # multi-instance loop), even though each entry's cache key is only
+    # (bay_id, block_id, x, y, orient_idx) tuples that could otherwise
+    # collide across different instances.
+    geometry_cache: dict = {}
+
     # -- Phase 2: repair infeasible assignments --------------------------------
     print(f"[Greedy] {'-' * 56}")
     print(f"[Greedy] Phase 2 : repair  mode={repair_mode}")
@@ -1994,7 +2113,7 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
         w1, w2, w3, t_start, timelimit,
         repair_mode=repair_mode, blocking_chain=blocking_chain,
         max_per_block=xpress_max_per_block,
-        use_maxrects=use_maxrects)
+        use_maxrects=use_maxrects, geometry_cache=geometry_cache)
 
     # 2026-07-22 (user-proposed perf fix): tracks a check_feasibility result
     # that exactly matches the CURRENT `assignments` at every point below --
@@ -2098,7 +2217,8 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                            annealing=annealing, z2z3_modes=z2z3_modes, seed=seed,
                            max_per_block=xpress_max_per_block,
                            z1_lower_bound=z1_lower_bound, z23_relax=z23_relax,
-                           use_maxrects=use_maxrects, known_result=last_verified_result)
+                           use_maxrects=use_maxrects, known_result=last_verified_result,
+                           geometry_cache=geometry_cache)
 
     elapsed_total = time.time() - t_start
     final_sol = {"operations": _build_operations(list(assignments.values()))}
@@ -3589,7 +3709,8 @@ def _improve(prob_info: dict,
             z1_lower_bound: float = 0.0,
             z23_relax: bool = True,
             use_maxrects: bool = False,
-            known_result: dict | None = None) -> dict[int, dict]:
+            known_result: dict | None = None,
+            geometry_cache: dict | None = None) -> dict[int, dict]:
     """
     Large-neighborhood-search-style improvement pass for an already FEASIBLE
     solution, targeting all three objective components (not just Z1).
@@ -3683,6 +3804,15 @@ def _improve(prob_info: dict,
         there's no partial change to reconcile, `assignments` genuinely
         hasn't moved since known_result was computed, so this is just reuse,
         not a new correctness-sensitive mechanism.
+    geometry_cache : optional (2026-07-24, user-proposed), passed straight
+        through to every xpress_reinsert.reinsert() call this function
+        makes -- see that function's own geometry_cache docstring for the
+        safety argument (a pure function of fixed candidate positions,
+        memoizable across every round of THIS run). Callers must create a
+        fresh dict once per greedyalgorithm() call, never reuse one across
+        different problem instances (see greedyalgorithm's own
+        geometry_cache comment for why). None (default) disables
+        memoization, identical to before this parameter existed.
     """
     from utils import check_feasibility
 
@@ -4051,6 +4181,7 @@ def _improve(prob_info: dict,
                     max_per_block=WHOLE_BAY_MAX_PER_BLOCK,
                     restrict_bay_id=target_bay_id,
                     current_positions=current_positions,
+                    geometry_cache=geometry_cache,
                 )
             except Exception:
                 partial = None
@@ -4129,6 +4260,7 @@ def _improve(prob_info: dict,
                     w1, w2, w3, deadline,
                     max_per_block=max_per_block,
                     current_positions=reinsert_current_positions,
+                    geometry_cache=geometry_cache,
                 )
             except Exception:
                 partial = None
@@ -4557,9 +4689,18 @@ def _repair(prob_info: dict,
             repair_mode: str = "greedy",
             blocking_chain: bool = True,
             max_per_block: int = 20,
-            use_maxrects: bool = False) -> tuple[dict[int, dict], dict | None]:
+            use_maxrects: bool = False,
+            geometry_cache: dict | None = None) -> tuple[dict[int, dict], dict | None]:
     """
     Iteratively detect infeasible blocks and repair them.
+
+    geometry_cache : optional (2026-07-24), passed straight through to the
+        blocking_chain joint xpress_reinsert.reinsert() call below -- see
+        that function's own geometry_cache docstring for the safety
+        argument and greedyalgorithm's comment for the "fresh dict per
+        greedyalgorithm() call, never reused across instances" requirement.
+        None (default) disables memoization, identical to before this
+        parameter existed.
 
     Runs up to max_passes rounds of: check_feasibility -> collect violating
     block ids -> re-place them.  Stops early if the solution becomes feasible
@@ -4847,6 +4988,7 @@ def _repair(prob_info: dict,
                         w1, w2, w3, t_start + timelimit * 0.80,
                         max_per_block=max_per_block,
                         current_positions=repair_current_positions,
+                        geometry_cache=geometry_cache,
                     )
                 except Exception as _dbg_exc:
                     import traceback
@@ -4966,6 +5108,24 @@ def _repair(prob_info: dict,
                     bay_placed_f, bay_schedule_f, bay_loads_f,
                     w1, w2, w3, forced_ids,
                     deadline=t_start + timelimit * 0.80,
+                    # 2026-07-24 bugfix: every id in to_repair was just added
+                    # to forced_ids above, so _place_blocks routes 100% of
+                    # this call through _force_place from the first block --
+                    # there is no search-based commit anywhere in this call
+                    # that the sorted_cache bookkeeping could miss. Without a
+                    # hard_deadline, _place_blocks' own `past_hard_deadline`
+                    # gate (see _force_place's sorted_cache docstring) never
+                    # fires, so every call falls back to _aabb_gap_entry's
+                    # plain O(bay size) scan -- the exact same "self-
+                    # reinforcing spiral" already found and fixed for Phase
+                    # 1's overtime tail (see OVERTIME_MAX_ACTIVE_BLOCKS'
+                    # docstring), just unfixed here for a large to_repair
+                    # batch. hard_deadline=t_start (always already in the
+                    # past) makes past_hard_deadline True immediately, so the
+                    # cache is used from the very first block instead of
+                    # only after some wall-clock threshold that has no
+                    # bearing on this already-fully-forced call.
+                    hard_deadline=t_start,
                     use_maxrects=use_maxrects,
                 )
                 assignments = dict(base_assignments)
@@ -5037,10 +5197,24 @@ def _repair(prob_info: dict,
         # them all land in the same "empty" slot and collide with EACH
         # OTHER. Commit each one (update bay_placed_f/bay_schedule_f/
         # bay_loads_f) before computing the next.
+        #
+        # 2026-07-24 bugfix: this loop used to call _force_place with no
+        # sorted_cache, so _aabb_gap_entry fell back to its plain O(bay
+        # size) scan on EVERY call -- the same "self-reinforcing spiral"
+        # already found and fixed for _place_blocks' own forced path (see
+        # OVERTIME_MAX_ACTIVE_BLOCKS' docstring: a 4000-block stress
+        # instance ran 9.6x over budget from exactly this pattern), just
+        # never ported to this standalone loop. This whole block is
+        # sequential force-placement with nothing else concurrently
+        # mutating any bay, so sharing one cache across every iteration is
+        # unconditionally safe (same precondition _place_blocks itself
+        # requires -- see _force_place's sorted_cache docstring).
+        _final_guarantee_sorted_cache: dict[int, list[tuple[int, int, int, Block]]] = {}
         for bid in final_viol_ids:
             bay_id, px, py, oi, entry, exit_t = _force_place(
                 bid, blocks_data, bays, bay_placed_f, bay_schedule_f,
                 blocks_data[bid]["bay_preferences"],
+                sorted_cache=_final_guarantee_sorted_cache,
             )
             new_blk = Block(block_id=bid, block_data=blocks_data[bid], x=px, y=py, orient_idx=oi)
             bay_placed_f[bay_id].append(new_blk)
