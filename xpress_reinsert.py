@@ -38,7 +38,7 @@ import time
 
 from baseline_greedy import _block_bbox, _placement_score
 from baseline_greedy import _top_candidates_for_block as _candidates_for_block
-from utils import Bay, Block, check_collisions, check_entry, check_exit
+from utils import Bay, Block, _bb_overlap, check_collisions, check_entry, check_exit
 
 # 2026-07-22: batches at or below this size get each other's current
 # position cross-injected into their candidate pools (see
@@ -386,6 +386,27 @@ def reinsert(remove_ids: list[int],
         for bi, cands in per_block.items():
             prob.addConstraint(xp.Sum(y[(bi, ci)] for ci in range(len(cands))) == 1)
 
+        # 2026-07-23 (user-proposed): world-space AABB per candidate,
+        # precomputed once here rather than inside the O(K^2 x candidates^2)
+        # pair loop below. check_collisions/check_entry/check_exit each
+        # already have their OWN internal AABB pre-filter (see their
+        # docstrings), so this doesn't unlock any new Shapely-skipping those
+        # don't already do -- what it skips is everything OUTSIDE that: two
+        # full Block() constructions (shape/layer resolution) plus up to
+        # three function-call layers (_crane_conflict's own four check_entry/
+        # check_exit calls) for every candidate pair whose footprints can
+        # never possibly conflict regardless of timing. Candidates spread
+        # across a large bay routinely have many same-bay, time-overlapping
+        # pairs that are nowhere near each other spatially -- exactly the gap
+        # this closes. bb[bi][ci] = (x0, y0, x1, y1) in world coordinates.
+        bb: dict[int, list[tuple[float, float, float, float]]] = {}
+        for bi, cands in per_block.items():
+            blk_bbs = []
+            for (_, _, cx, cy, oi, _, _) in cands:
+                lx0, ly0, lx1, ly1 = _block_bbox(blocks_data[bi], oi)
+                blk_bbs.append((cx + lx0, cy + ly0, cx + lx1, cy + ly1))
+            bb[bi] = blk_bbs
+
         ids = list(per_block.keys())
         for a in range(len(ids)):
             if deadline is not None and time.time() > deadline:
@@ -394,7 +415,8 @@ def reinsert(remove_ids: list[int],
                 bi, bj = ids[a], ids[b]
                 for ci, (_, bay_i, cx_i, cy_i, oi_i, entry_i, exit_i) in enumerate(per_block[bi]):
                     for cj, (_, bay_j, cx_j, cy_j, oi_j, entry_j, exit_j) in enumerate(per_block[bj]):
-                        if bay_i != bay_j or not _time_overlaps(entry_i, exit_i, entry_j, exit_j):
+                        if (bay_i != bay_j or not _time_overlaps(entry_i, exit_i, entry_j, exit_j)
+                                or not _bb_overlap(bb[bi][ci], bb[bj][cj])):
                             continue
                         blk_i = Block(block_id=bi, block_data=blocks_data[bi],
                                      x=cx_i, y=cy_i, orient_idx=oi_i)
