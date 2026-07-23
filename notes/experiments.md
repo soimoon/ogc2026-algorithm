@@ -311,3 +311,15 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 `b621af5`는 5개 서브변경 묶음이라 계속 분리: max_source_blocks 캡 비활성화(무죄), `_justify_deadline`을 옛 공식으로 복원(무죄), `_aabb_gap_entry`를 옛 iterative-push로 복원(무죄) -- 셋 다 회귀를 못 고침. 그 와중에 **"before"(5차 원본) 자체가 반복마다 값이 크게 흔들리는 것 발견**(prob_14: 3회 중 2회 872,404,889라는 파국적 값, prob_34: 한 번은 안정적 3.0-3.1M대인데 다른 실행에선 10.6M/16.9M 이상치) -- 세션 내내 누적된 시스템 부하가 원인으로 의심, 1회는 물론 3회 반복도 이 노이즈 앞에선 확정적 결론에 부족할 수 있음을 재확인.
 
 **사용자 판단으로 여기서 종결**: `b621af5`가 원인이라는 것 자체는 확정, 정확한 서브원인(남은 후보: `_repair` 78% 컷오프+emergency-guarantee, `_improve`의 known_result 재사용)은 다음 세션 과제로 이월. prob_32/34가 다른 4개보다 w1이 훨씬 낮고(3,333 vs 13K-29K) w3가 훨씬 높은(533-600 vs 133-200) 공통점은 P3/P6 성격 추정 단서로 남겨둠.
+
+## 2026-07-23 (이어서 5) -- CP-SAT reinsert() 프로토타입 + xpress_reinsert의 기존-블록 안전성 결함 발견/수정
+
+`wholebay`의 O(K²) 제약 폭발(오랜 스케일링 병목)을 CP-SAT의 조합 제약으로 대체할 수 있을지 프로토타입(`cpsat_reinsert.py`) 작성. 기하는 CP-SAT 안에서 전혀 새로 모델링하지 않고 기존 `check_collisions`/`_crane_conflict`(Shapely 기반)를 그대로 재사용, CP-SAT은 "미리 계산된 충돌 사실을 어떻게 조합 제약으로 표현하느냐"만 다르게 함.
+
+사용자가 초기 설계(연결요소별 완전그래프 판별 -> NoOverlap, 아니면 개별 쌍 제약 폴백)에 3가지 문제 제기: (1) 배치 전체에 대한 사전 AABB 스캔이 K가 커지면 그 자체로 O(K²) 비용, (2) NoOverlap이 시간축을 고정 interval로 다뤄서 동적 시간 압축 유연성을 잃음, (3) 완전그래프 판별 자체가 O(V²)라 이점 없이 오버헤드만 더할 위험. 합의한 순서대로 재설계: ① bay별 격자 공간 해싱으로 AABB 겹침 후보를 O(n log n)급으로 축소 ② 완전그래프/clique 판별과 NoOverlap 전부 제거, 확인된 충돌 쌍은 Xpress와 동일하게 항상 개별 `y_i+y_j<=1` 제약으로 표현 (③ `_left_justify` 후처리 연동은 낮은 우선순위로 보류, 아직 미착수).
+
+**재검증 중 실제 운영 코드(`xpress_reinsert.py`)의 진짜 결함 발견**: CP-SAT vs Xpress 정확성 비교(`equiv_cpsat_vs_xpress.py`)에서 Xpress 결과를 전체 솔루션에 넣고 재검증하면 가끔 진짜 infeasible이 나옴. 추적 결과 `_cross_position_candidate`(다른 블록의 옛 자리를 빌려 스왑 후보로 제안)와 `_current_position_candidate`(자기 자신의 현재 자리를 그대로 재제안) 둘 다, `reinsert()`의 쌍별 충돌 제약 루프가 **배치 멤버끼리만** 비교하고 **배치에 속하지 않는 기존 점유 블록과는 절대 비교하지 않는다는 점**을 이용해, 검증 없이 통과할 수 있는 구조적 허점이었음. 직접 재현(prob_39)해서 `_cross_position_candidate`의 후보가 기존 블록과 entry 3건+exit 2건의 진짜 충돌을 갖고 있음을 확인. `_current_position_candidate`는 `_improve`의 LNS 경로(제거 대상이 항상 이미 feasible)에서는 안전하지만, `_repair`의 blocking_chain 경로(to_repair 자체가 이미 위반 중)에서는 같은 논리가 성립하지 않아 동일한 결함을 안고 있었음.
+
+**수정**: 두 주입 지점 모두, 대상 bay의 기존 점유 블록에 대해 배치-쌍별 충돌 검사와 동일한 `check_collisions`+`_crane_conflict` 조합으로 사전 검증(`_cross_candidate_blocked_by_existing`)하고, 위반 시 후보 자체를 스킵하도록 수정. **검증**: `equiv_cpsat_vs_xpress.py` INFEASIBLE-MISMATCH 2건 -> 0건(남은 8건은 전부 benign한 OBJ-MISMATCH), 40개 로컬 로버스트 40/40. `experiment/reinsert-candidate-existing-block-safety` -> main merge. (자세한 내용은 `notes/algorithm_overview.md` #77)
+
+**다음 단계**: K=25/50/100+ 스케일링 실측(Xpress vs CP-SAT interleaved)으로 복귀. CP-SAT 쪽 `_left_justify` 후처리 연동은 그 이후.
