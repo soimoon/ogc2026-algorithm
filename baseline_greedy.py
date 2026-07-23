@@ -3805,6 +3805,35 @@ def _improve(prob_info: dict,
             except Exception:
                 partial = None
             used_wholebay = partial is not None
+            if partial is None:
+                # 2026-07-23 (measured on prob_40, 300s run): when
+                # reinsert() fails for a wholebay-scale batch (candidate
+                # generation running out of its round deadline is the
+                # common case -- see reinsert()'s own DEBUG bail prints;
+                # measured elsewhere in this same run at ~25s just to
+                # generate candidates for a 30-block batch), len(remove_ids)
+                # here is a whole bay's contents (K=25+ in the observed
+                # case), always far past JOINT_MAX_K -- so falling through
+                # to the plain `_place_blocks` greedy fallback below would
+                # re-place the ENTIRE removed bay one block at a time from
+                # scratch, discarding whatever structure the bay had before
+                # this round even started. Measured directly: exactly this
+                # path produced an objective 9.6x worse than the
+                # current best (67.5M vs 7.0M), correctly rejected by the
+                # accept-only-if-better gate below -- but only after
+                # burning the round's remaining time on a walk that could
+                # never plausibly have won. Bail out immediately instead
+                # (same "nothing to offer this round" pattern as the empty
+                # remove_ids case above) so the leftover time goes to the
+                # next operator draw instead.
+                print(f"[Greedy] Improve: mode=wholebay k={k} candidate/MIP generation "
+                      f"failed (likely deadline) -- skipping round instead of falling back "
+                      f"to whole-bay greedy re-placement")
+                empty_operators_seen.add(mode)
+                if len(empty_operators_seen) >= len(active_operator_names):
+                    print(f"[Greedy] Improve: nothing left to improve (Z1/Z2/Z3 all settled)  round={round_idx}")
+                    break
+                continue
         elif mode == "balance":
             target_bay_id = min(range(len(bays)), key=lambda j: bay_weights[j] * bay_loads[j])
             partial = _try_rebalance_move(
