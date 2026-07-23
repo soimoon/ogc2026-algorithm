@@ -619,14 +619,50 @@ def _find_earliest_slot(new_blk: Block,
     ]
     relevant_blocks = [b for b, _ in relevant]
     relevant_schedule = [sched for _, sched in relevant]
+    # 2026-07-23 (user-proposed): O(1) lookup from a relevant block's id back
+    # to its own (a, e) schedule -- needed by the jump optimization below to
+    # find a returned obstruction's exit_time without a linear re-scan.
+    _sched_by_id = {b.block_id: sched for b, sched in zip(relevant_blocks, relevant_schedule)}
 
     candidate_entries = sorted({r_time} | {e for _, e in relevant_schedule if e > r_time})
 
-    for entry_candidate in candidate_entries:
+    # 2026-07-23 (user-proposed): jump-past-the-blocker instead of a plain
+    # linear scan through candidate_entries. check_entry/check_exit (even
+    # with fast=True) already construct and return an EntryObstruction with
+    # `existing_block` identifying exactly which block caused the failure --
+    # the old code below discarded that and just moved to the next
+    # candidate_entries value, re-running a full real Shapely check_entry/
+    # check_exit call (this function's dominant real cost, confirmed via
+    # cProfile: check_entry alone was 990K calls / 154s of a 267s run) even
+    # though, if a block A obstructs new_blk at some entry_candidate, A is a
+    # FIXED existing block (its own geometry never changes) that is
+    # necessarily still "present" (a_A < entry' < e_A) for every
+    # candidate_entries value up to e_A -- so every one of those candidates
+    # is PROVABLY infeasible for the exact same reason, with no need to
+    # re-verify it via another real Shapely call. Skip straight to the first
+    # candidate_entries value >= the blocker's own exit_time (guaranteed to
+    # already be a member of candidate_entries, since a relevant block only
+    # contributes to this loop's obstruction in the first place if its own
+    # exit_time is > r_time -- exactly the same condition used to build
+    # candidate_entries above). bisect's `lo=idx+1` both guarantees forward
+    # progress (no infinite loop) and is redundant with the fact that
+    # e_blocker is always strictly greater than the current candidate (since
+    # a_blocker < entry < e_blocker was the presence condition that made it
+    # an obstruction) -- kept anyway as a cheap, unconditional safety net.
+    #
+    # check_exit's jump target differs from check_entry's: the loop variable
+    # is `entry`, but a check_exit obstruction is about `exit_t = entry +
+    # proc` colliding with some blocker D present up to e_D (a_D < exit_t <
+    # e_D) -- so the next USABLE entry must satisfy entry >= e_D - proc, not
+    # entry >= e_D. Same guaranteed-forward-progress argument: e_D > exit_t
+    # = entry + proc implies e_D - proc > entry.
+    n_candidates = len(candidate_entries)
+    idx = 0
+    while idx < n_candidates:
         if deadline is not None and time.time() > deadline:
             return None, None
 
-        entry  = max(r_time, entry_candidate)
+        entry  = candidate_entries[idx]  # always already >= r_time by construction
         exit_t = entry + proc
 
         # Stage-2: blocks already present when new_blk arrives.
@@ -636,8 +672,21 @@ def _find_earliest_slot(new_blk: Block,
             b for b, (a, e) in zip(relevant_blocks, relevant_schedule)
             if a < entry < e
         ]
-        if check_entry(bay, present_at_entry, new_blk, fast=True):
-            continue  # crane path blocked at entry -> try next exit boundary
+        entry_obs = check_entry(bay, present_at_entry, new_blk, fast=True)
+        if entry_obs:
+            blocker = entry_obs[0].existing_block
+            if blocker.block_id == new_blk.block_id:
+                # Self-reference sentinel (see EntryObstruction/check_entry's
+                # docstring): new_blk doesn't fit the BAY BOUNDARY at this
+                # (x, y, orient_idx) at all -- a purely spatial fact,
+                # independent of entry time. No later candidate_entries value
+                # can ever fix this, so no jump target exists -- bail out
+                # immediately instead of (incorrectly) treating it as "blocked
+                # by some other block that eventually leaves".
+                return None, None
+            e_blocker = _sched_by_id[blocker.block_id][1]
+            idx = bisect.bisect_left(candidate_entries, e_blocker, idx + 1)
+            continue  # crane path blocked at entry -> jump past this blocker
 
         # Stage-3: blocks still present when new_blk departs.
         # Mirrors check_feasibility: a_k < exit_t < e_k  (strict both ends).
@@ -645,8 +694,12 @@ def _find_earliest_slot(new_blk: Block,
             b for b, (a, e) in zip(relevant_blocks, relevant_schedule)
             if a < exit_t < e
         ]
-        if check_exit(bay, present_at_exit, new_blk, fast=True):
-            continue  # crane path blocked at exit -> try next exit boundary
+        exit_obs = check_exit(bay, present_at_exit, new_blk, fast=True)
+        if exit_obs:
+            blocker = exit_obs[0].existing_block
+            e_blocker = _sched_by_id[blocker.block_id][1]
+            idx = bisect.bisect_left(candidate_entries, e_blocker - proc, idx + 1)
+            continue  # crane path blocked at exit -> jump past this blocker
 
         # Stage-4+ pre-check: does inserting new_blk here retroactively break
         # any ALREADY-PLACED block's own already-committed crane operation,
@@ -691,6 +744,14 @@ def _find_earliest_slot(new_blk: Block,
                     s4_blocked = True
                     break
         if s4_blocked:
+            # No simple single-parameter jump target here (unlike Stage-2/3
+            # above) -- a Stage-4 conflict depends on the CANDIDATE WINDOW
+            # [entry, exit_t), not just entry, and multiple different
+            # b_other's could each independently invalidate different
+            # windows. Plain next-index advance (this loop's cost is
+            # dominated by Stage-2/3's check_entry/check_exit calls anyway,
+            # per profiling -- see this function's docstring).
+            idx += 1
             continue
 
         return entry, exit_t
