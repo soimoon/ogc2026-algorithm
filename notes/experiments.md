@@ -261,3 +261,11 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 검증: x16/combined_3400 각 3회 전부 attempt 1(EDD)만 소진(대형 인스턴스는 재시작 1개뿐이라 영향 없음, 예상대로). prob_2에서 attempt 2가 새 순환표의 edd를 정확히 가져오는 것 확인. 40개 로버스트 40/40. `experiment/priority-rule-restart-cycle` -> main merge.
 
 **남은 큰 과제**: wholebay의 O(K²) MIP 구성 비용 스케일링(대규모 파괴 연산자의 진짜 병목), P1의 4→5차 악화 원인 재조사, Bottom-Left-Fill+sweep-line으로 MaxRects 교체(사용자 제안, 오늘 논의만 하고 미착수).
+
+## 2026-07-23 -- 6차 제출 실채점 결과 분석, Phase1 예산 축소 + MaxRects orientation 공유 되돌림, 7차 패키징
+
+**6차 결과 (5차 대비)**: P1 -15.7%(개선), P2 -42.6%(대폭 개선), P3 +38.9%(악화, 3연속), P4/P5 거의 동일, P6 +20.4%(악화, 3~5차 내내 안정적이던 추세가 처음 깨짐). 사용자 질문 2건에 답변: (1) P1/P2 개선이 Phase1 예산 축소 때문 아니냐 -> 반증 근거(P2가 여러 코드 버전에 걸쳐 완전 동일값 반복하다 이번에 깨진 패턴, P4/P5가 크기-게이트 로직 도입 이후에도 거의 안 움직인 것)로 기각, priority_rule 다양화/emergency-fallback 보강 쪽이 더 유력. (2) 순위 기반(R-n_b) 채점에서 objective 악화 + Tier 상승이 공존 가능한가 -> 가능, 절대값이 아니라 상대 순위라 자연스러운 결과.
+
+**조치**: 로컬에서부터 "효과 불확실"로 스스로 flag했던 두 항목(#67 MaxRects orientation 공유, #68 Phase1 예산 인스턴스 크기별 축소)만 `experiment/revert-phase1-shrink-maxrects-share` 브랜치에서 되돌림(`git revert -m 1`, 코드는 충돌 없음). MaxRects 자체(O(m²)->MaxRects 알고리즘 전환, #51/#57)는 유지. 40개 로컬 로버스트 40/40 feasible, 0 크래시 -> main merge -> `submissions/submission_20260723_1250.zip` 패키징 완료.
+
+**남은 과제**: P3의 4->5->6차 3연속 악화는 이번 되돌리기로 설명 안 됨(4->5차 악화는 이 두 항목이 생기기도 전 일). 여러 세션에 걸쳐 누적된 오버헤드("연산자 희석" 가설)가 다음 조사 대상.
