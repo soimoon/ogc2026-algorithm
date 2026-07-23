@@ -1004,6 +1004,28 @@ CANDIDATE_DIVERSITY_MAX_DEGRADE_FRAC = 0.1
 # still validated safe via the same AABB ranking guarantee.
 CANDIDATE_SCAN_CAP = 50
 
+# 2026-07-22 (user-proposed): fraction of timelimit Phase 1's full search
+# gets before falling back to the cheap graduated-overtime search (see
+# _place_blocks' hard_deadline docstring), and the extended ceiling before
+# forcing unconditionally. Adaptive by instance size (2026-07-22, later same
+# day) -- an A/B sweep (combined_stress_3400, 3400 blocks, n=2/condition)
+# found smaller fractions (0.2/0.3) gave tighter, more consistent objectives
+# there, but the SAME smaller fractions measurably HURT prob_1 (100 blocks,
+# n=3/condition: 0.15/0.25 gave a 69,343 mean vs. 0.5/0.6's 30,066, worst of
+# every fraction tried) -- small instances finish Phase 1's full search well
+# within even the current 50% share (see the ~87ms/block, zero-forced-
+# fallback measurement on prob_1), so cutting the budget there only removes
+# real search quality with no deadline pressure to relieve in exchange.
+# Reuses MAXRECTS_MIN_BLOCKS as the size threshold (same "large enough to
+# behave differently from every local instance" cutoff already validated
+# for the MaxRects engine switch) rather than inventing a second, unrelated
+# threshold -- untested at exactly this boundary, but a defensible reuse of
+# an already-justified cutoff rather than an arbitrary new one.
+PHASE1_DEADLINE_FRAC_SMALL = 0.5
+PHASE1_HARD_DEADLINE_FRAC_SMALL = 0.6
+PHASE1_DEADLINE_FRAC_LARGE = 0.2
+PHASE1_HARD_DEADLINE_FRAC_LARGE = 0.3
+
 # 2026-07-22 (user-caught robustness issue): scan budget used in _place_blocks
 # for blocks that land in the deadline/hard_deadline "overtime" window (see
 # that function's docstring). Deliberately much smaller than
@@ -1772,16 +1794,40 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     bay_schedule: list[list[tuple[int, int]]]   = [[] for _ in range(n_bays)]
     bay_loads:    list[float]                   = [0.0] * n_bays
 
-    # Phase 1 gets at most 50% of the total timelimit for full search. This
-    # was originally 75%, but Phase 1's per-block search has no "good enough,
-    # stop" early exit -- it always explores every candidate for the best
-    # score -- so in practice it happily consumes its *entire* allotment on
-    # every instance, not just large/hard ones. With Phase 3 now existing to
-    # spend leftover time on tardiness specifically, Phase 1 no longer needs
-    # (or should get) the lion's share of the budget: a decent-not-perfect
-    # Phase 1 construction plus more Phase 3 rounds empirically beats a
-    # maximally-searched Phase 1 with almost no Phase 3 left.
-    phase1_deadline = t_start + timelimit * 0.5
+    # Phase 1 gets at most PHASE1_DEADLINE_FRAC of the total timelimit for
+    # full search. This was originally 75%, cut to 50% (2026-07-20) on the
+    # reasoning that Phase 1's per-block search has no "good enough, stop"
+    # early exit -- it always explores every candidate for the best score --
+    # so in practice it happily consumes its *entire* allotment on every
+    # instance, not just large/hard ones, and Phase 3 needs real room to
+    # spend leftover time on tardiness specifically.
+    #
+    # 2026-07-22 (user-proposed, same reasoning pushed further): measured
+    # directly that Phase 1's elapsed/total ratio stays ~50-58% across EVERY
+    # scale tested that day (100 to 4000 blocks) -- not because large
+    # instances need that much, but because Phase 1 happily spends up to its
+    # ceiling regardless (confirmed on prob_1: all 100 blocks placed via full
+    # search, zero forced fallback, yet Phase 3 stalled early with budget
+    # unused). Top teams likely keep construction simple/fast and spend the
+    # real optimization budget on improvement.
+    #
+    # A/B sweep confirmed this cuts both ways by instance size: on
+    # combined_stress_3400 (3400 blocks), shrinking to 0.2/0.3 gave tighter,
+    # more consistent objectives (134.0-147.7B baseline spread -> 140.2-
+    # 140.3B). But the SAME smaller fractions measurably HURT prob_1 (100
+    # blocks): 0.15/0.25 gave a 69,343 mean vs. 0.5/0.6's 30,066, worst of
+    # every fraction tried -- small instances finish Phase 1's full search
+    # well within even the current 50% share, so cutting the budget there
+    # only removes real search quality with no deadline pressure to relieve
+    # in exchange. Switched by size accordingly (reusing MAXRECTS_MIN_BLOCKS
+    # as the cutoff -- same "large enough to behave differently from every
+    # local instance" threshold already validated for the MaxRects engine
+    # switch above, rather than inventing an untested second one).
+    if use_maxrects:
+        _p1_frac, _p1_hard_frac = PHASE1_DEADLINE_FRAC_LARGE, PHASE1_HARD_DEADLINE_FRAC_LARGE
+    else:
+        _p1_frac, _p1_hard_frac = PHASE1_DEADLINE_FRAC_SMALL, PHASE1_HARD_DEADLINE_FRAC_SMALL
+    phase1_deadline = t_start + timelimit * _p1_frac
     # 2026-07-20: bounded "cliff" mitigation -- see _place_blocks'
     # hard_deadline docstring. Fixed, known-in-advance ceiling (never
     # estimated/adaptive) -- only ever matters when phase1_deadline is hit
@@ -1791,7 +1837,7 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     # still needs real room afterward, and TLE is the single worst possible
     # outcome (-1, same as a crash) -- this is the more conservative side of
     # what was considered.
-    phase1_hard_deadline = t_start + timelimit * 0.6
+    phase1_hard_deadline = t_start + timelimit * _p1_hard_frac
 
     if priority_rule == "regret":
         print(f"[Greedy] {'-' * 56}")
