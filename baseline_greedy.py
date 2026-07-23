@@ -4777,11 +4777,24 @@ def _repair(prob_info: dict,
             # candidate scan to each block's own current bay instead of
             # always scanning every bay -- that all-bays scan measured as
             # the dominant per-round cost on congested bays (see
-            # notes/algorithm_overview.md). Safe to include even though
-            # to_repair's positions are individually violating: the MIP's
-            # pairwise conflict constraints still apply to this candidate
-            # like any other, so a genuinely conflicting "current position"
-            # pair can never both be chosen.
+            # notes/algorithm_overview.md).
+            #
+            # 2026-07-23 correction: this comment used to claim it's safe to
+            # include even though to_repair's positions are individually
+            # violating because "the MIP's pairwise conflict constraints
+            # still apply to this candidate like any other" -- that's only
+            # true for conflicts BETWEEN two to_repair members. It says
+            # nothing about a to_repair block's OWN current (and, here,
+            # possibly genuinely violating) position conflicting with a
+            # non-repaired block that's staying put, which the pairwise
+            # loop never checks (it only compares batch members against
+            # each other). Confirmed as a real gap and fixed at the actual
+            # source: reinsert()'s _current_position_candidate injection
+            # now re-validates against the target bay's existing occupants
+            # before accepting the candidate at all (mirrors the same fix
+            # already applied to _cross_position_candidate), so this
+            # comment no longer needs the reader to take that safety on
+            # faith at this call site.
             repair_current_positions = {
                 bid: (assignments[bid]["bay_id"], assignments[bid]["x"], assignments[bid]["y"],
                      assignments[bid]["orient_idx"], assignments[bid]["entry_time"],
