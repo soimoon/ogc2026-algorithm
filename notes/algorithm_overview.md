@@ -459,6 +459,15 @@
     **검증**: 버그 재현 스크립트로 수정 전/후 직접 비교(수정 후 block 77이 bay 경계 안의 유효한 위치로 배치됨 확인), 40개 로컬 로버스트 40/40. `experiment/cross-position-candidate-bounds-fix` -> main merge.
     **다음 단계**: 이 수정을 반영해 CP-SAT vs Xpress 정확성 비교 재실행 후, K=25/50/100+ 스케일링 실측으로 진행 예정.
 
+77. **`_cross_position_candidate`/`_current_position_candidate`가 기존(비-배치) 블록 안전성을 전혀 검증하지 않던 진짜 구조적 결함 발견/수정 (2026-07-23)**
+    **배경**: `#76`의 경계검사 수정을 반영해 CP-SAT vs Xpress 정확성 비교를 재실행했는데도 `INFEASIBLE-MISMATCH`가 남아있어 계속 파고듦(사용자 지시: "지금 계속 파고들기"). prob_39/trial=2(seed=2, remove_ids=[18,156,63,190,19])에서 Xpress 결과가 실제로 infeasible(`block 151 entry obstructed by block 63`, `block 27 entry obstructed by block 156`)로 나오는 걸 직접 재현.
+    **원인 추적**: 블록 19의 선택된 후보 `(bay=1, x=111, y=2, oi=1, entry=32, exit=44)`가 `_top_candidates_for_block`(Stage-4까지 전부 검증하는 안전한 후보 생성 경로)이 실제로 반환한 목록에는 **없는** 값임을 직접 대조로 확인(그 목록엔 entry=29만 있었음) -- 즉 `_find_earliest_slot` 기반이 아닌 다른 경로에서 주입된 값. 직접 재현해 `_cross_position_candidate`가 반환한 후보(다른 블록 bj의 옛 자리에 블록 bi를 끼워 넣는 swap 후보)를 그 bay의 실제 기존 점유 블록들과 `check_entry`/`check_exit`로 직접 대조하니, **entry 3건 + exit 2건의 진짜 충돌**이 확인됨(전부 이번 배치에 속하지 않는, 원래 자리를 지키던 블록들과의 충돌).
+    **핵심 문제**: `reinsert()`의 쌍별 충돌 제약 루프(O(K²×candidates²))는 **배치 멤버끼리만** 비교하지, 배치에 속하지 않는 기존 점유 블록과는 절대 비교하지 않음. `_find_earliest_slot` 기반 후보는 애초에 `bay_placed`를 직접 스캔해서 안전하지만, `_cross_position_candidate`는 다른 블록의 (x,y)/entry를 그대로 재사용만 하고 이 검증을 건너뜀 -- `#76`이 "안전 설계상 무해했을 가능성이 높다"고 평가했던 것과 달리, **기존 블록을 소급 파손시키는 진짜 정확성 결함**이었음이 이번에 직접 반증됨.
+    **연쇄 발견**: 같은 문제가 `_current_position_candidate`(자기 자신의 현재 위치를 그대로 재제안)에도 잠재해 있음을 코드 검토로 확인. 이건 `_improve`의 LNS 연산자(제거 대상이 항상 이미 feasible한 블록)에서는 "제거 전 상태가 이미 전체 검증된 feasible 상태였다 -> 배치 멤버를 뺀 부분집합에서는 절대 새 충돌이 생길 수 없다"는 논리로 안전하지만, `_repair`의 blocking_chain 경로(`baseline_greedy.py` L4780-4784)는 to_repair 자체가 **이미 위반 중인** 블록들이라 이 전제가 성립하지 않음 -- 기존 주석은 "배치끼리의 쌍별 제약이 있으니 안전하다"고만 설명해서 기존-블록 충돌 가능성을 아예 놓치고 있었음.
+    **수정**: `_cross_candidate_blocked_by_existing()` 헬퍼를 신설(기존 배치-쌍별 충돌 검사와 동일한 `check_collisions`+`_crane_conflict` 조합을 대상 bay의 기존 점유 블록에 대해 적용) -> `_cross_position_candidate`와 `_current_position_candidate` 두 주입 지점 모두에 적용, 위반 시 후보 자체를 스킵. `_improve` 경로에서는 항상 통과하는 no-op, `_repair` blocking_chain 경로에서는 실제 안전망으로 작동. `xpress_reinsert.py` 모듈 docstring과 `baseline_greedy.py`의 관련 주석도 과거의 낙관적 안전성 주장을 정정.
+    **검증**: 재현 스크립트로 직접 확인(수정 후 `blocked_by_existing=True`로 올바르게 걸러짐), `equiv_cpsat_vs_xpress.py`(prob_1/20/39, 30개 시나리오)로 INFEASIBLE-MISMATCH 0건 확인(수정 전 2건 -> 0건, 남은 8건은 전부 benign한 OBJ-MISMATCH), 40개 로컬 로버스트 40/40. `experiment/reinsert-candidate-existing-block-safety` -> main merge.
+    **다음 단계**: K=25/50/100+ 스케일링 실측(Xpress vs CP-SAT interleaved)으로 복귀.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
