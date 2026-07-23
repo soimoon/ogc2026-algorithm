@@ -279,3 +279,13 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 부수적으로 새 버그 발견: `mode=wholebay k=25 via=greedy rejected obj=67482827`(best 대비 9.6배 악화) -- wholebay 실패 시 `len(remove_ids)>JOINT_MAX_K`라 그리디로 bay 전체를 순차 재배치하는 경로를 타는데, 항상 참담해서 결국 reject되지만 그 사이 Phase3의 마지막 라운드 예산을 낭비. **수정**: wholebay 실패 시 그리디 폴백 대신 즉시 라운드 포기(`experiment/wholebay-skip-on-failure`). 40개 로버스트 40/40, prob_38/39/40 재실행으로 "skipping round" 로그가 의도대로 뜨는 것 확인. `main` merge.
 
 **다음 과제**: xpress_reinsert 후보생성의 O(m²) 자체를 손보는 게 유일한 근본 해법이지만 과거 2번(#44, #47(b)/#50) 되돌린 이력 있음 -- 재시도 전에 실패 원인부터 정리하고 설계 논의 필요. 현재 코드의 크기-적응 로직은 `MAXRECTS_MIN_BLOCKS=300`(Phase1 전용, xpress_reinsert 미적용)과 `myalgorithm.py`의 크기비례 안전마진(#65) 둘뿐임도 재확인.
+
+## 2026-07-23 (이어서 2) -- `_find_earliest_slot` blocker-jump: 진짜 병목 해결
+
+이어서 xpress_reinsert의 O(m²) 후보생성을 직접 프로파일링(cProfile, prob_40 300초) -> 실제 병목은 후보 위치 생성이 아니라 `_find_earliest_slot` 내부에서 후보 하나당 실제 Shapely `check_entry`(990,083회/154초, 전체의 57%)를 반복 호출하는 것으로 확인. 후보 위치 생성 알고리즘(#44/#47/#50이 전부 여기서 실패)과는 다른 지점.
+
+사용자 제안: `check_entry`가 실패하면 다음 candidate로 순차 이동하는 대신, 막은 블록(blocker)의 exit_time으로 바로 점프. 코드 확인 결과 `check_entry`/`check_exit`가 `fast=True`로도 이미 어떤 블록이 막았는지(`existing_block`) 반환하는데 기존 코드가 버리고 있었음 -- 추가 비용 없이 적용 가능. `check_entry` 실패는 blocker의 exit_time으로, `check_exit` 실패는 `exit_time - proc`으로 점프(막힌 게 entry가 아니라 exit_t=entry+proc이므로). bay 경계 위반(self-reference sentinel) 케이스는 시간 무관하게 항상 실패하므로 점프 대신 즉시 반환하도록 별도 처리(첫 구현에서 이 케이스 놓쳐서 KeyError 남, 발견 즉시 수정).
+
+**검증**: OLD(git HEAD, 선형 스캔) vs NEW(점프) 25,000회 synthetic 비교(실제 인스턴스 3개 폴리곤 형상, 밀집 배치 조건 강화) -> **0 mismatch**. prob_40 300초 재실행(경합 없음): Phase1 136.7s->110.1s(-19%), Repair 74-81s->42.4s(-45~48%), xpress 배치당 candidates+pairs ~34.5s->~18.7s(-46%). 40개 로버스트 40/40. `experiment/find-earliest-slot-blocker-jump` -> main merge.
+
+**다음 논의**: 사용자가 Phase별 후보생성기 분리(Phase3을 뜯어낸 블록 bounding box 근처로 공간 제한)를 재시도할 만한지 질문 -> 과거 실패들은 "후보 위치 자체를 바꾸는" 축이었고 이건 "교차곱 재료 블록 풀을 공간 근접성으로 제한"하는 다른 축이라 오늘 것과 곱해져 누적될 가능성 있다고 판단 -- 오늘 개선 이후에도 Phase3 라운드가 여전히 부족하면 별도 브랜치에서 시도하기로 함, 아직 미착수.
