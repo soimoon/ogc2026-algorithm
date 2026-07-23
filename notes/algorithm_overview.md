@@ -433,6 +433,15 @@
     **검증**: 버그 수정 후 OLD(#72 이전 시점) vs NEW 25,000회 synthetic 등가성 재검증 -> **0 mismatch**. prob_40 300초 재실행(경합 없음, blocker-jump 단독 대비): Phase1 110.1s->98.4s, Repair 42.4s->28.2s, xpress 배치당 candidates ~11.5s->~9s, **재시작 1회->2회**(여유 시간 확보로 두 번째 재시작 완주), 최종 objective **7,857,782->4,874,726**(두 번째 재시작이 전혀 다른 시작점에서 훨씬 나은 해 발견). 40개 로컬 로버스트 40/40 feasible, 0 크래시. `experiment/find-earliest-slot-conflict-cache` -> main merge.
     **다음 논의**: 사용자가 "그럼 이벤트 슬라이싱을 마저 도입하면 더 좋아질까" 질문 -> `_find_earliest_slot` **호출 한 번 안에서는** 관련 블록당 정확히 1회 검사로 이미 이론적 하한에 도달했다고 판단, 이벤트 슬라이싱이 추가로 노릴 수 있는 건 "호출 간/후보 간" 중복뿐인데 그건 `#67`에서 이미 위험 영역(active_in_bay가 EDD 순서로 비단조적이라 persistent 캐시가 불안전)으로 확인된 것과 같은 데를 다시 건드리는 셈 -> 바로 설계 들어가기 전에 재프로파일링으로 호출 간 중복이 실제로 얼마나 남아있는지부터 확인하기로 함(다음 항목).
 
+74. **`xpress_reinsert`의 쌍별 충돌 구성 루프에 AABB 사전필터 추가 (사용자 제안, 2026-07-23) -- CP-SAT 검토 중 발견**
+    **계기**: 사용자가 "K를 늘리려면 CP-SAT(interval 변수 + NoOverlap)로 재설계하는 게 낫지 않냐"고 제안 -- Xpress의 O(K²) 명시적 쌍별 충돌 제약이 wholebay의 오랜 스케일링 병목이라는 데는 동의했으나, 설계 전에 실제 코드를 보니 `reinsert()`의 쌍별 충돌 구성 루프(`baseline_greedy.py`가 아니라 `xpress_reinsert.py:389-412`)가 같은 bay + 시간 겹침만 거르고 곧장 `check_collisions`/`_crane_conflict`(내부에서 4번의 `check_entry`/`check_exit` 호출)를 부르는데, **공간(AABB) 사전필터가 아예 없었음** -- 오늘 `_find_earliest_slot`에서 고친 것과 같은 종류의 구멍.
+    **중요한 재발견**: `check_collisions`/`check_entry`/`check_exit` 전부 이미 자기 내부에서 같은 AABB 사전필터를 하므로(각 함수 docstring에 명시), 이 구멍은 "실제 기하 계산을 아낀다"는 의미의 병목이 아니라 "Block() 생성 2회 + 함수 호출 오버헤드"만 아끼는 종류 -- CP-SAT로 솔버를 바꿔도 이 구성 루프 자체(파이썬)는 하나도 안 빨라진다는 걸 사용자와 함께 확인, 그래서 CP-SAT 재설계보다 먼저 이 필터부터 추가하기로 함(사용자: "사전 필터도 추가하고, CP-SAT도 하면 되지 않아?" -> 둘 다 진행하되 순서만 이걸 먼저).
+    **구현**: `_block_bbox(blocks_data[bi], oi) + (cx,cy)` 오프셋으로 후보별 world AABB를 루프 밖에서 한 번만 계산(`bb[bi][ci]`), 쌍별 루프에서 `_bb_overlap`이 False면 Block 생성/기하 검사 전부 건너뜀.
+    **정확성 근거**: `Block.bounding_rect()`가 `_block_bbox`(local)의 순수 평행이동(x,y)이라는 걸 두 함수 소스로 직접 확인 -- 외부에서 계산한 AABB와 `check_collisions` 등이 내부에서 계산하는 AABB가 수학적으로 동일, 즉 이 필터가 스킵하는 쌍은 어차피 기존 코드도 제약을 안 걸었을 쌍(가짜양성/음성 불가능).
+    **검증**: OLD(필터 없음) vs NEW 45개 synthetic 재배치 시나리오(실제 인스턴스 3개, 진짜 bay 상태에서 K=2~8 배치 추출) 비교 -> 42-43/45 완전 일치. 나머지 2-3건은 objective가 소수점 7자리까지 동일(차이 ~1e-7, MIP 허용오차 수준)한 **동점 최적해**로 확인(`threads=1` 강제해도 재현되어 멀티스레드 비결정성이 원인이 아님을 배제) -- 정확성 문제 아님. 40개 로컬 로버스트 40/40. `experiment/xpress-reinsert-aabb-prefilter` -> main merge.
+    **속도**: 케이스에 따라 다름 -- wholebay처럼 후보가 한 bay 안에 몰리는 상황은 AABB가 대부분 겹쳐서 필터가 걸러낼 게 적어 효과 불확실(실측: K=96 배치의 "pairs=" 시간 거의 그대로, ~37s). 여러 bay/넓게 흩어진 배치에서 더 도움될 것으로 예상되나 별도 재측정 필요.
+    **CP-SAT 방향**: 이 필터와 별개로, 사용자가 "CP-SAT면 K를 수십 단위까지 갈 수 있는 거 아니냐"고 재질문 -> Xpress의 O(K²) 명시적 쌍별 제약(각 쌍마다 `y_i+y_j<=1` 개별 제약)이 진짜 스케일링 한계이고, CP-SAT의 interval 변수+`NoOverlap`은 이런 "여러 개가 안 겹쳐야 함"을 전용 전파 알고리즘(edge-finding 등)으로 처리해 제약을 하나하나 나열 안 해도 되므로 훨씬 큰 K를 다룰 수 있다는 데 합의 -- 별도 모듈(`cpsat_reinsert.py`)로 설계/프로토타입 진행 중(공간 후보 생성은 기존 그대로 재사용, 시간 충돌만 CP-SAT interval+NoOverlap으로 대체).
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
