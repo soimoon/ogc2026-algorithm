@@ -612,6 +612,24 @@ def _find_earliest_slot(new_blk: Block,
     # candidate_entries and got scanned in the Stage-4+ loop on every single
     # iteration, despite being physically incapable of ever obstructing this
     # position.
+    # 2026-07-23: bay-boundary containment is checked internally by
+    # check_entry too (its "Condition 1"), but it depends ONLY on
+    # new_blk's own fixed (x, y, orient_idx) and the bay -- never on
+    # `blocks` or on time -- so, like a block-pair conflict fact, it can
+    # only ever have ONE answer for this whole call. The caching
+    # optimization below skips calling check_entry entirely whenever there
+    # is nothing new left to test (`untested` empty) -- which would
+    # silently skip this boundary check too if it were left implicit inside
+    # check_entry, since an empty `blocks` list is exactly the case where
+    # `untested` is empty on the very first iteration. Make it explicit and
+    # upfront instead: if new_blk doesn't fit the bay at all, no
+    # candidate_entries value can ever fix that, so bail out immediately
+    # (matches what the old linear scan eventually also always returned for
+    # a boundary violation -- None, None -- just without needlessly
+    # re-deriving the same fact on every iteration first).
+    if not bay.contains_block(new_blk):
+        return None, None
+
     new_bbox = new_blk.bounding_rect()
     relevant = [
         (b, sched) for b, sched in zip(placed_in_bay, schedule_in_bay)
@@ -656,6 +674,44 @@ def _find_earliest_slot(new_blk: Block,
     # e_D) -- so the next USABLE entry must satisfy entry >= e_D - proc, not
     # entry >= e_D. Same guaranteed-forward-progress argument: e_D > exit_t
     # = entry + proc implies e_D - proc > entry.
+    # 2026-07-23 (user-proposed, refined after re-reading check_entry/
+    # check_exit's own code): check_entry(bay, [B], new_blk) and
+    # check_exit(bay, [B], new_blk) test the EXACT SAME pairwise geometry
+    # for a single existing block B -- both build new_blk's layers as the
+    # "new/target" role and check them against B's layers for the same
+    # (k, j>=k) pairs (confirmed directly in both functions' source: the
+    # crane moves purely vertically, so descent and ascent sweep through
+    # identical height levels -- also stated explicitly in check_exit's own
+    # docstring: "the j >= k rule applies in both directions"). So whether B
+    # crane-conflicts with new_blk AT THIS FIXED POSITION is a single fact,
+    # independent of whether we're asking via a Stage-2 (entry) or Stage-3
+    # (exit) lens -- yet the code below used to call check_entry for
+    # Stage-2 and check_exit for Stage-3 as fully separate black boxes,
+    # silently re-deriving the same Shapely intersection for any block that
+    # happened to matter to both (e.g. present at both a candidate's entry
+    # AND a later candidate's exit). Cache each relevant block's confirmed
+    # conflict-or-not fact the first time it's learned (from EITHER check),
+    # and reuse it for both roles and across every remaining candidate_entries
+    # iteration in this call -- on top of the jump above (which already stops
+    # a KNOWN blocker from being re-tested at all), this stops a DIFFERENT
+    # block that only becomes relevant later (present at some later
+    # candidate's exit, say) from re-triggering a fresh geometry check if its
+    # conflict status was already learned earlier for a different purpose.
+    #
+    # Only two cache states are ever written, both provably safe:
+    #   - a `fast=True` call that returns an obstruction: exactly ONE block
+    #     (the returned one) is confirmed conflicting -- cache just that one
+    #     as True. (fast=True stops at the first match, so nothing can be
+    #     inferred about any other still-untested block in this call.)
+    #   - a `fast=True` call that returns empty: fast=True only short-
+    #     circuits on a MATCH, so an empty result means every block actually
+    #     passed to this call was checked and found non-conflicting -- safe
+    #     to cache ALL of them as False.
+    # Blocks already in the cache are excluded from the blocks list passed
+    # to check_entry/check_exit each iteration, so a cached block is never
+    # geometry-checked again for the rest of this function call.
+    _conflict_cache: dict[int, bool] = {}
+
     n_candidates = len(candidate_entries)
     idx = 0
     while idx < n_candidates:
@@ -672,7 +728,15 @@ def _find_earliest_slot(new_blk: Block,
             b for b, (a, e) in zip(relevant_blocks, relevant_schedule)
             if a < entry < e
         ]
-        entry_obs = check_entry(bay, present_at_entry, new_blk, fast=True)
+        known_blocker = next(
+            (b for b in present_at_entry if _conflict_cache.get(b.block_id) is True), None
+        )
+        if known_blocker is not None:
+            e_blocker = _sched_by_id[known_blocker.block_id][1]
+            idx = bisect.bisect_left(candidate_entries, e_blocker, idx + 1)
+            continue  # crane path blocked at entry (cache hit) -> jump, no Shapely call
+        untested = [b for b in present_at_entry if b.block_id not in _conflict_cache]
+        entry_obs = check_entry(bay, untested, new_blk, fast=True) if untested else []
         if entry_obs:
             blocker = entry_obs[0].existing_block
             if blocker.block_id == new_blk.block_id:
@@ -682,24 +746,39 @@ def _find_earliest_slot(new_blk: Block,
                 # independent of entry time. No later candidate_entries value
                 # can ever fix this, so no jump target exists -- bail out
                 # immediately instead of (incorrectly) treating it as "blocked
-                # by some other block that eventually leaves".
+                # by some other block that eventually leaves". Never cached
+                # (not a real existing block).
                 return None, None
+            _conflict_cache[blocker.block_id] = True
             e_blocker = _sched_by_id[blocker.block_id][1]
             idx = bisect.bisect_left(candidate_entries, e_blocker, idx + 1)
             continue  # crane path blocked at entry -> jump past this blocker
+        for b in untested:
+            _conflict_cache[b.block_id] = False
 
         # Stage-3: blocks still present when new_blk departs.
         # Mirrors check_feasibility: a_k < exit_t < e_k  (strict both ends).
-        present_at_exit = [new_blk] + [
+        present_at_exit_others = [
             b for b, (a, e) in zip(relevant_blocks, relevant_schedule)
             if a < exit_t < e
         ]
-        exit_obs = check_exit(bay, present_at_exit, new_blk, fast=True)
+        known_blocker = next(
+            (b for b in present_at_exit_others if _conflict_cache.get(b.block_id) is True), None
+        )
+        if known_blocker is not None:
+            e_blocker = _sched_by_id[known_blocker.block_id][1]
+            idx = bisect.bisect_left(candidate_entries, e_blocker - proc, idx + 1)
+            continue  # crane path blocked at exit (cache hit) -> jump, no Shapely call
+        untested = [b for b in present_at_exit_others if b.block_id not in _conflict_cache]
+        exit_obs = check_exit(bay, [new_blk] + untested, new_blk, fast=True) if untested else []
         if exit_obs:
             blocker = exit_obs[0].existing_block
+            _conflict_cache[blocker.block_id] = True
             e_blocker = _sched_by_id[blocker.block_id][1]
             idx = bisect.bisect_left(candidate_entries, e_blocker - proc, idx + 1)
             continue  # crane path blocked at exit -> jump past this blocker
+        for b in untested:
+            _conflict_cache[b.block_id] = False
 
         # Stage-4+ pre-check: does inserting new_blk here retroactively break
         # any ALREADY-PLACED block's own already-committed crane operation,
