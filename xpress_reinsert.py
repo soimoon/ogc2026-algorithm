@@ -108,9 +108,9 @@ def _current_position_candidate(bi: int, blk_data: dict, current_pos: tuple,
 
 
 def _cross_position_candidate(bi: int, blk_data: dict, my_orient_idx: int,
-                              other_pos: tuple, bay_loads: list[float],
+                              other_pos: tuple, bay: Bay, bay_loads: list[float],
                               bay_weights: list[float],
-                              w1: float, w2: float, w3: float) -> tuple:
+                              w1: float, w2: float, w3: float) -> tuple | None:
     """
     2026-07-22 (user-proposed). Score block bi occupying a DIFFERENT block's
     current (bay_id, x, y) -- bi's own orientation/shape/processing_time,
@@ -140,6 +140,19 @@ def _cross_position_candidate(bi: int, blk_data: dict, my_orient_idx: int,
     block's entry time as a starting guess (the natural "swap" hypothesis:
     each block takes over where the other one was, when it was there),
     combined with bi's own processing_time for the exit.
+
+    2026-07-23 bugfix (found while comparing against a CP-SAT prototype):
+    the other block's reference-point (x, y) is only guaranteed valid for
+    ITS OWN bbox, not for bi's bbox at my_orient_idx -- if that orientation's
+    local bbox has a negative min corner (reference point not at the
+    shape's own bottom-left, which real instances do have), reusing the
+    other block's (x, y) as-is can place bi's footprint partly outside the
+    bay entirely. Harmless in production today (the caller's downstream
+    check_feasibility would reject any batch this ends up in, per this
+    module's whole safety design), but wasteful -- a single invalid
+    candidate can drag an otherwise-good batch's chosen combination into a
+    guaranteed rejection. Bounds-checked explicitly now; returns None
+    (skip injecting) rather than a candidate that could never be valid.
     """
     other_bay_id, other_cx, other_cy, _other_oi, other_entry, _other_exit = other_pos
     r_time = blk_data["release_time"]
@@ -149,6 +162,11 @@ def _cross_position_candidate(bi: int, blk_data: dict, my_orient_idx: int,
     prefs = blk_data["bay_preferences"]
     s_max = max(prefs)
     blk_bb = _block_bbox(blk_data, my_orient_idx)
+
+    lx0, ly0, lx1, ly1 = blk_bb
+    if (other_cx + lx0 < 0 or other_cy + ly0 < 0
+            or other_cx + lx1 > bay.width or other_cy + ly1 > bay.height):
+        return None
 
     entry = max(r_time, other_entry)
     exit_t = entry + proc
@@ -362,8 +380,10 @@ def reinsert(remove_ids: list[int],
                         continue
                     cross_cand = _cross_position_candidate(
                         bi, blocks_data[bi], my_orient_idx, current_positions[bj],
-                        bay_loads, bay_weights, w1, w2, w3,
+                        bays[current_positions[bj][0]], bay_loads, bay_weights, w1, w2, w3,
                     )
+                    if cross_cand is None:
+                        continue  # bi's shape at this orientation doesn't fit bj's spot
                     already_present = any(
                         c[1:] == cross_cand[1:] for c in cands
                     )
