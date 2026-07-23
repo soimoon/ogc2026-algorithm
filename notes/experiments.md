@@ -269,3 +269,13 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 **조치**: 로컬에서부터 "효과 불확실"로 스스로 flag했던 두 항목(#67 MaxRects orientation 공유, #68 Phase1 예산 인스턴스 크기별 축소)만 `experiment/revert-phase1-shrink-maxrects-share` 브랜치에서 되돌림(`git revert -m 1`, 코드는 충돌 없음). MaxRects 자체(O(m²)->MaxRects 알고리즘 전환, #51/#57)는 유지. 40개 로컬 로버스트 40/40 feasible, 0 크래시 -> main merge -> `submissions/submission_20260723_1250.zip` 패키징 완료.
 
 **남은 과제**: P3의 4->5->6차 3연속 악화는 이번 되돌리기로 설명 안 됨(4->5차 악화는 이 두 항목이 생기기도 전 일). 여러 세션에 걸쳐 누적된 오버헤드("연산자 희석" 가설)가 다음 조사 대상.
+
+## 2026-07-23 (이어서) -- 7차 채점 대기 중: NFP 재검토 -> 기각, wholebay 가설 -> 기각, 진짜 병목(xpress_reinsert 후보생성) 재확인 + wholebay 폴백 버그 수정
+
+사용자가 NFP(패킹 밀도 각도, "기울어진 다각형 bbox 낭비가 P4-6엔 문제일 것") 재도입을 제안 -> prob_38/39/40(로컬 최혼잡 인스턴스, 60초)로 재측정해도 bbox peak 점유율 33-53%로 여전히 공간이 병목이 아님 확인, NFP 재기각.
+
+"그럼 P4-6에 다른 가능성은?" 재질문 -> wholebay 연산자(대규모 bay 재조립)의 MIP 스케일링 실패 가설을 300초(실제 서버 시간대에 가까움) 진단으로 검증 -> wholebay는 시도되면 2/2 성공, 대신 Phase1+Repair가 예산의 최대 72%를 다 써서 Phase3가 8-22라운드밖에 못 돎(가설 기각). Repair의 81초를 프로파일링 -> MIP solve는 0.1-0.3초, 74초 중 70초가 후보생성(`_top_candidates_for_block`) -- prob_40(250블록)이 MaxRects 임계값(300) 미만이라 Phase1도 같은 O(m²) 후보생성을 쓰고, 블록당 처리시간이 bay 점유 블록 수에 비례해 느려지는 것도 직접 확인. **Phase1/Repair/Phase3 전부가 같은 O(m²) 후보생성 비용을 공유한다는 게 정량적으로 재확인됨.**
+
+부수적으로 새 버그 발견: `mode=wholebay k=25 via=greedy rejected obj=67482827`(best 대비 9.6배 악화) -- wholebay 실패 시 `len(remove_ids)>JOINT_MAX_K`라 그리디로 bay 전체를 순차 재배치하는 경로를 타는데, 항상 참담해서 결국 reject되지만 그 사이 Phase3의 마지막 라운드 예산을 낭비. **수정**: wholebay 실패 시 그리디 폴백 대신 즉시 라운드 포기(`experiment/wholebay-skip-on-failure`). 40개 로버스트 40/40, prob_38/39/40 재실행으로 "skipping round" 로그가 의도대로 뜨는 것 확인. `main` merge.
+
+**다음 과제**: xpress_reinsert 후보생성의 O(m²) 자체를 손보는 게 유일한 근본 해법이지만 과거 2번(#44, #47(b)/#50) 되돌린 이력 있음 -- 재시도 전에 실패 원인부터 정리하고 설계 논의 필요. 현재 코드의 크기-적응 로직은 `MAXRECTS_MIN_BLOCKS=300`(Phase1 전용, xpress_reinsert 미적용)과 `myalgorithm.py`의 크기비례 안전마진(#65) 둘뿐임도 재확인.
