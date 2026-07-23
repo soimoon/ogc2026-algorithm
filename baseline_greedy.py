@@ -297,46 +297,42 @@ def _candidate_positions(bay_w: float, bay_h: float,
 
 
 
-def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
-                                   placed_blocks: list[Block],
-                                   blk_bb: tuple[float, float, float, float],
-                                   min_width: float | None = None,
-                                   min_height: float | None = None) -> list[tuple[int, int]]:
+def _maxrects_free_space(bay_w: float, bay_h: float,
+                         placed_blocks: list[Block],
+                         sliver_w: float, sliver_h: float,
+                         ) -> list[tuple[float, float, float, float]]:
     """
-    EXPERIMENTAL (2026-07-22): MaxRects + sliver-pruning, re-attempt after
-    #48's MaxRects regressed prob_1 and showed no speedup on congested
-    stress instances. Sliver pruning discards a free-rectangle fragment the
-    instant a split produces one narrower/shorter than the CURRENT block's
-    own (bw, bh) -- provably lossless for this call (a fragment that's
-    already too small can only get smaller under further splits, so it can
-    never satisfy this call's final size check either way), and tames the
-    free-list blowup that made unpruned MaxRects catastrophically slow on
-    scattered configurations (0->4.9s at m=200 unpruned -> ~0.2s pruned,
-    synthetic benchmark). Being re-tried end-to-end (both call sites) to
-    see whether the earlier Phase-3-candidate-diversity collapse was itself
-    a symptom of MaxRects's unpruned slowness (deadline/budget checks
-    truncating candidate generation) rather than a separate issue. See
-    notes/algorithm_overview.md.
+    Replay `placed_blocks` into a bay and return the pruned free-rectangle
+    list (MaxRects + sliver-pruning -- see _candidate_positions_maxrects2's
+    original docstring for the algorithm itself, preserved here verbatim).
 
-    min_width / min_height : optional (2026-07-22, user-proposed), the
-        smallest width/height across every block this whole _place_blocks
-        call might place (see its caller). Folded into the per-split
-        pruning threshold below (max(bw, min_width)) -- but since bw (THIS
-        call's own block) is always >= the global min by definition, this
-        is currently a no-op: the per-call threshold already dominates it.
-        Kept and wired through anyway so it's ready to matter once the
-        free-rect list persists across calls instead of being rebuilt from
-        scratch every time (deferred -- see notes/algorithm_overview.md) --
-        a persistent list can't safely prune by "this call's own block"
-        alone, since a fragment discarded now must stay valid for whatever
-        smaller block arrives many calls later.
+    Split out from _candidate_positions_maxrects2 (2026-07-22, user-proposed,
+    "safe subset of persistent MaxRects"): the ORIGINAL idea was to persist
+    this free list across DIFFERENT blocks' calls, but that turns out to be
+    unsound here -- `active_in_bay` (this function's `placed_blocks`) is
+    filtered by `e_k > r_time`, i.e. a block that has already exited frees
+    its space back up, and _place_blocks processes block_ids in EDD (due-
+    date) order, NOT release-time order, so which blocks count as "active"
+    can jump non-monotonically between consecutive calls -- a naive
+    across-calls cache would treat a since-departed block's old footprint as
+    still occupied. Persisting across TIME-VARYING queries would need a real
+    space+time data structure (e.g. an interval tree keyed on occupancy
+    window), not just a longer-lived free-rect list -- deferred as a much
+    bigger, riskier project.
+
+    What IS safe and still valuable: sharing this replay across the SAME
+    block's multiple ORIENTATIONS. All orientations of one about-to-be-
+    placed block see the identical `placed_blocks`/r_time context -- only
+    the orientation's own (bw, bh) differs, and that's consumed entirely by
+    the separate final-fit check in `_maxrects_extract_candidates` below,
+    not by this function. Call this ONCE per bay using the conservative
+    sliver_w/sliver_h (see `_place_blocks`'s `maxrects_min_width`/
+    `maxrects_min_height` -- already the global minimum across every
+    orientation of every block this whole call might place, so it can only
+    keep MORE fragments than any single orientation strictly needs, never
+    fewer), then call `_maxrects_extract_candidates` per orientation against
+    the one shared result.
     """
-    lx0, ly0, lx1, ly1 = blk_bb
-    bw = lx1 - lx0
-    bh = ly1 - ly0
-    sliver_w = max(bw, min_width) if min_width is not None else bw
-    sliver_h = max(bh, min_height) if min_height is not None else bh
-
     free: list[tuple[float, float, float, float]] = [(0.0, 0.0, float(bay_w), float(bay_h))]
     for b in placed_blocks:
         px0, py0, px1, py1 = b.bounding_rect()
@@ -362,7 +358,22 @@ def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
             ):
                 pruned.append(r)
         free = pruned
+    return free
 
+
+def _maxrects_extract_candidates(free: list[tuple[float, float, float, float]],
+                                 blk_bb: tuple[float, float, float, float],
+                                 bay_w: float, bay_h: float) -> list[tuple[int, int]]:
+    """
+    Final per-orientation step: which free rectangles fit this SPECIFIC
+    (bw, bh), converted to integer reference-point candidates. See
+    _maxrects_free_space's docstring for why this is split out separately --
+    this is the only part of the computation that depends on the querying
+    block's own orientation.
+    """
+    lx0, ly0, lx1, ly1 = blk_bb
+    bw = lx1 - lx0
+    bh = ly1 - ly0
     candidates = set()
     for (fx0, fy0, fx1, fy1) in free:
         if fx1 - fx0 + 1e-6 >= bw and fy1 - fy0 + 1e-6 >= bh:
@@ -371,6 +382,35 @@ def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
             if x + lx1 <= bay_w + 1e-6 and y + ly1 <= bay_h + 1e-6:
                 candidates.add((int(x), int(y)))
     return sorted(candidates)
+
+
+def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
+                                   placed_blocks: list[Block],
+                                   blk_bb: tuple[float, float, float, float],
+                                   min_width: float | None = None,
+                                   min_height: float | None = None) -> list[tuple[int, int]]:
+    """
+    Single-orientation MaxRects candidate generation -- thin composition of
+    `_maxrects_free_space` + `_maxrects_extract_candidates` (split out
+    2026-07-22 so `_place_blocks` can share the free-space replay across one
+    block's multiple orientations instead of calling this whole function
+    once per orientation; see `_maxrects_free_space`'s docstring). Kept as a
+    single entry point for any caller that just wants one orientation's
+    candidates without managing the two-step split itself.
+
+    min_width / min_height : optional, folded into the sliver-pruning
+    threshold as max(bw, min_width) -- a no-op here since bw (this call's
+    own single orientation) already dominates any smaller global minimum;
+    see `_maxrects_free_space`'s docstring for where this parameter
+    actually matters (the shared multi-orientation path in _place_blocks).
+    """
+    lx0, ly0, lx1, ly1 = blk_bb
+    bw = lx1 - lx0
+    bh = ly1 - ly0
+    sliver_w = max(bw, min_width) if min_width is not None else bw
+    sliver_h = max(bh, min_height) if min_height is not None else bh
+    free = _maxrects_free_space(bay_w, bay_h, placed_blocks, sliver_w, sliver_h)
+    return _maxrects_extract_candidates(free, blk_bb, bay_w, bay_h)
 
 
 # 2026-07-22: how many jittered positions to add per kept free rectangle,
@@ -963,6 +1003,28 @@ CANDIDATE_DIVERSITY_MAX_DEGRADE_FRAC = 0.1
 # trades a smaller per-combo exploration for a much lower worst-case total,
 # still validated safe via the same AABB ranking guarantee.
 CANDIDATE_SCAN_CAP = 50
+
+# 2026-07-22 (user-proposed): fraction of timelimit Phase 1's full search
+# gets before falling back to the cheap graduated-overtime search (see
+# _place_blocks' hard_deadline docstring), and the extended ceiling before
+# forcing unconditionally. Adaptive by instance size (2026-07-22, later same
+# day) -- an A/B sweep (combined_stress_3400, 3400 blocks, n=2/condition)
+# found smaller fractions (0.2/0.3) gave tighter, more consistent objectives
+# there, but the SAME smaller fractions measurably HURT prob_1 (100 blocks,
+# n=3/condition: 0.15/0.25 gave a 69,343 mean vs. 0.5/0.6's 30,066, worst of
+# every fraction tried) -- small instances finish Phase 1's full search well
+# within even the current 50% share (see the ~87ms/block, zero-forced-
+# fallback measurement on prob_1), so cutting the budget there only removes
+# real search quality with no deadline pressure to relieve in exchange.
+# Reuses MAXRECTS_MIN_BLOCKS as the size threshold (same "large enough to
+# behave differently from every local instance" cutoff already validated
+# for the MaxRects engine switch) rather than inventing a second, unrelated
+# threshold -- untested at exactly this boundary, but a defensible reuse of
+# an already-justified cutoff rather than an arbitrary new one.
+PHASE1_DEADLINE_FRAC_SMALL = 0.5
+PHASE1_HARD_DEADLINE_FRAC_SMALL = 0.6
+PHASE1_DEADLINE_FRAC_LARGE = 0.2
+PHASE1_HARD_DEADLINE_FRAC_LARGE = 0.3
 
 # 2026-07-22 (user-caught robustness issue): scan budget used in _place_blocks
 # for blocks that land in the deadline/hard_deadline "overtime" window (see
@@ -1732,16 +1794,40 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     bay_schedule: list[list[tuple[int, int]]]   = [[] for _ in range(n_bays)]
     bay_loads:    list[float]                   = [0.0] * n_bays
 
-    # Phase 1 gets at most 50% of the total timelimit for full search. This
-    # was originally 75%, but Phase 1's per-block search has no "good enough,
-    # stop" early exit -- it always explores every candidate for the best
-    # score -- so in practice it happily consumes its *entire* allotment on
-    # every instance, not just large/hard ones. With Phase 3 now existing to
-    # spend leftover time on tardiness specifically, Phase 1 no longer needs
-    # (or should get) the lion's share of the budget: a decent-not-perfect
-    # Phase 1 construction plus more Phase 3 rounds empirically beats a
-    # maximally-searched Phase 1 with almost no Phase 3 left.
-    phase1_deadline = t_start + timelimit * 0.5
+    # Phase 1 gets at most PHASE1_DEADLINE_FRAC of the total timelimit for
+    # full search. This was originally 75%, cut to 50% (2026-07-20) on the
+    # reasoning that Phase 1's per-block search has no "good enough, stop"
+    # early exit -- it always explores every candidate for the best score --
+    # so in practice it happily consumes its *entire* allotment on every
+    # instance, not just large/hard ones, and Phase 3 needs real room to
+    # spend leftover time on tardiness specifically.
+    #
+    # 2026-07-22 (user-proposed, same reasoning pushed further): measured
+    # directly that Phase 1's elapsed/total ratio stays ~50-58% across EVERY
+    # scale tested that day (100 to 4000 blocks) -- not because large
+    # instances need that much, but because Phase 1 happily spends up to its
+    # ceiling regardless (confirmed on prob_1: all 100 blocks placed via full
+    # search, zero forced fallback, yet Phase 3 stalled early with budget
+    # unused). Top teams likely keep construction simple/fast and spend the
+    # real optimization budget on improvement.
+    #
+    # A/B sweep confirmed this cuts both ways by instance size: on
+    # combined_stress_3400 (3400 blocks), shrinking to 0.2/0.3 gave tighter,
+    # more consistent objectives (134.0-147.7B baseline spread -> 140.2-
+    # 140.3B). But the SAME smaller fractions measurably HURT prob_1 (100
+    # blocks): 0.15/0.25 gave a 69,343 mean vs. 0.5/0.6's 30,066, worst of
+    # every fraction tried -- small instances finish Phase 1's full search
+    # well within even the current 50% share, so cutting the budget there
+    # only removes real search quality with no deadline pressure to relieve
+    # in exchange. Switched by size accordingly (reusing MAXRECTS_MIN_BLOCKS
+    # as the cutoff -- same "large enough to behave differently from every
+    # local instance" threshold already validated for the MaxRects engine
+    # switch above, rather than inventing an untested second one).
+    if use_maxrects:
+        _p1_frac, _p1_hard_frac = PHASE1_DEADLINE_FRAC_LARGE, PHASE1_HARD_DEADLINE_FRAC_LARGE
+    else:
+        _p1_frac, _p1_hard_frac = PHASE1_DEADLINE_FRAC_SMALL, PHASE1_HARD_DEADLINE_FRAC_SMALL
+    phase1_deadline = t_start + timelimit * _p1_frac
     # 2026-07-20: bounded "cliff" mitigation -- see _place_blocks'
     # hard_deadline docstring. Fixed, known-in-advance ceiling (never
     # estimated/adaptive) -- only ever matters when phase1_deadline is hit
@@ -1751,7 +1837,7 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
     # still needs real room afterward, and TLE is the single worst possible
     # outcome (-1, same as a crash) -- this is the more conservative side of
     # what was considered.
-    phase1_hard_deadline = t_start + timelimit * 0.6
+    phase1_hard_deadline = t_start + timelimit * _p1_hard_frac
 
     if priority_rule == "regret":
         print(f"[Greedy] {'-' * 56}")
@@ -2519,6 +2605,26 @@ def _place_blocks(
                         return (r[2] - r[0]) * (r[3] - r[1])
                     active_in_bay = sorted(active_in_bay, key=_block_area, reverse=True)
 
+                # 2026-07-22 (user-proposed, "safe subset of persistent
+                # MaxRects" -- see _maxrects_free_space's docstring for why
+                # sharing ACROSS blocks isn't sound but sharing across one
+                # block's own orientations is): all orientations of THIS
+                # block share the identical active_in_bay/r_time context, so
+                # replay the free-space split ONCE per bay here instead of
+                # once per orientation inside the loop below. Uses
+                # maxrects_min_width/height (the global minimum across every
+                # orientation of every block this whole _place_blocks call
+                # might place) as the sliver threshold -- safe because it's
+                # always <= this block's own per-orientation (bw, bh), so it
+                # can only keep MORE fragments than any single orientation
+                # strictly needs, never fewer; the per-orientation fit check
+                # still happens separately in _maxrects_extract_candidates.
+                if use_maxrects:
+                    _shared_free = _maxrects_free_space(
+                        bay.width, bay.height, active_in_bay,
+                        maxrects_min_width, maxrects_min_height,
+                    )
+
                 # 2026-07-22 bugfix: capping active_in_bay above bounds
                 # candidate-GENERATION cost, but each orientation still pays
                 # its own full _find_earliest_slot search against this bay's
@@ -2559,11 +2665,15 @@ def _place_blocks(
                     # per-instance choice, decided once by the caller.
                     # active_in_bay is computed (and, if use_maxrects,
                     # area-sorted) once per bay above, outside this
-                    # orientation loop -- reused as-is here.
+                    # orientation loop -- reused as-is here. _shared_free
+                    # (the free-space replay) is ALSO computed once per bay
+                    # above (2026-07-22) -- only the cheap per-orientation
+                    # fit-check runs here now, see _maxrects_free_space's
+                    # docstring for why sharing across orientations (but not
+                    # across different blocks) is safe.
                     if use_maxrects:
-                        candidates = _candidate_positions_maxrects2(
-                            bay.width, bay.height, active_in_bay, blk_bb,
-                            min_width=maxrects_min_width, min_height=maxrects_min_height,
+                        candidates = _maxrects_extract_candidates(
+                            _shared_free, blk_bb, bay.width, bay.height,
                         )
                     else:
                         candidates = _candidate_positions(
