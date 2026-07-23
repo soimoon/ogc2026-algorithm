@@ -297,42 +297,46 @@ def _candidate_positions(bay_w: float, bay_h: float,
 
 
 
-def _maxrects_free_space(bay_w: float, bay_h: float,
-                         placed_blocks: list[Block],
-                         sliver_w: float, sliver_h: float,
-                         ) -> list[tuple[float, float, float, float]]:
+def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
+                                   placed_blocks: list[Block],
+                                   blk_bb: tuple[float, float, float, float],
+                                   min_width: float | None = None,
+                                   min_height: float | None = None) -> list[tuple[int, int]]:
     """
-    Replay `placed_blocks` into a bay and return the pruned free-rectangle
-    list (MaxRects + sliver-pruning -- see _candidate_positions_maxrects2's
-    original docstring for the algorithm itself, preserved here verbatim).
+    EXPERIMENTAL (2026-07-22): MaxRects + sliver-pruning, re-attempt after
+    #48's MaxRects regressed prob_1 and showed no speedup on congested
+    stress instances. Sliver pruning discards a free-rectangle fragment the
+    instant a split produces one narrower/shorter than the CURRENT block's
+    own (bw, bh) -- provably lossless for this call (a fragment that's
+    already too small can only get smaller under further splits, so it can
+    never satisfy this call's final size check either way), and tames the
+    free-list blowup that made unpruned MaxRects catastrophically slow on
+    scattered configurations (0->4.9s at m=200 unpruned -> ~0.2s pruned,
+    synthetic benchmark). Being re-tried end-to-end (both call sites) to
+    see whether the earlier Phase-3-candidate-diversity collapse was itself
+    a symptom of MaxRects's unpruned slowness (deadline/budget checks
+    truncating candidate generation) rather than a separate issue. See
+    notes/algorithm_overview.md.
 
-    Split out from _candidate_positions_maxrects2 (2026-07-22, user-proposed,
-    "safe subset of persistent MaxRects"): the ORIGINAL idea was to persist
-    this free list across DIFFERENT blocks' calls, but that turns out to be
-    unsound here -- `active_in_bay` (this function's `placed_blocks`) is
-    filtered by `e_k > r_time`, i.e. a block that has already exited frees
-    its space back up, and _place_blocks processes block_ids in EDD (due-
-    date) order, NOT release-time order, so which blocks count as "active"
-    can jump non-monotonically between consecutive calls -- a naive
-    across-calls cache would treat a since-departed block's old footprint as
-    still occupied. Persisting across TIME-VARYING queries would need a real
-    space+time data structure (e.g. an interval tree keyed on occupancy
-    window), not just a longer-lived free-rect list -- deferred as a much
-    bigger, riskier project.
-
-    What IS safe and still valuable: sharing this replay across the SAME
-    block's multiple ORIENTATIONS. All orientations of one about-to-be-
-    placed block see the identical `placed_blocks`/r_time context -- only
-    the orientation's own (bw, bh) differs, and that's consumed entirely by
-    the separate final-fit check in `_maxrects_extract_candidates` below,
-    not by this function. Call this ONCE per bay using the conservative
-    sliver_w/sliver_h (see `_place_blocks`'s `maxrects_min_width`/
-    `maxrects_min_height` -- already the global minimum across every
-    orientation of every block this whole call might place, so it can only
-    keep MORE fragments than any single orientation strictly needs, never
-    fewer), then call `_maxrects_extract_candidates` per orientation against
-    the one shared result.
+    min_width / min_height : optional (2026-07-22, user-proposed), the
+        smallest width/height across every block this whole _place_blocks
+        call might place (see its caller). Folded into the per-split
+        pruning threshold below (max(bw, min_width)) -- but since bw (THIS
+        call's own block) is always >= the global min by definition, this
+        is currently a no-op: the per-call threshold already dominates it.
+        Kept and wired through anyway so it's ready to matter once the
+        free-rect list persists across calls instead of being rebuilt from
+        scratch every time (deferred -- see notes/algorithm_overview.md) --
+        a persistent list can't safely prune by "this call's own block"
+        alone, since a fragment discarded now must stay valid for whatever
+        smaller block arrives many calls later.
     """
+    lx0, ly0, lx1, ly1 = blk_bb
+    bw = lx1 - lx0
+    bh = ly1 - ly0
+    sliver_w = max(bw, min_width) if min_width is not None else bw
+    sliver_h = max(bh, min_height) if min_height is not None else bh
+
     free: list[tuple[float, float, float, float]] = [(0.0, 0.0, float(bay_w), float(bay_h))]
     for b in placed_blocks:
         px0, py0, px1, py1 = b.bounding_rect()
@@ -358,22 +362,7 @@ def _maxrects_free_space(bay_w: float, bay_h: float,
             ):
                 pruned.append(r)
         free = pruned
-    return free
 
-
-def _maxrects_extract_candidates(free: list[tuple[float, float, float, float]],
-                                 blk_bb: tuple[float, float, float, float],
-                                 bay_w: float, bay_h: float) -> list[tuple[int, int]]:
-    """
-    Final per-orientation step: which free rectangles fit this SPECIFIC
-    (bw, bh), converted to integer reference-point candidates. See
-    _maxrects_free_space's docstring for why this is split out separately --
-    this is the only part of the computation that depends on the querying
-    block's own orientation.
-    """
-    lx0, ly0, lx1, ly1 = blk_bb
-    bw = lx1 - lx0
-    bh = ly1 - ly0
     candidates = set()
     for (fx0, fy0, fx1, fy1) in free:
         if fx1 - fx0 + 1e-6 >= bw and fy1 - fy0 + 1e-6 >= bh:
@@ -382,35 +371,6 @@ def _maxrects_extract_candidates(free: list[tuple[float, float, float, float]],
             if x + lx1 <= bay_w + 1e-6 and y + ly1 <= bay_h + 1e-6:
                 candidates.add((int(x), int(y)))
     return sorted(candidates)
-
-
-def _candidate_positions_maxrects2(bay_w: float, bay_h: float,
-                                   placed_blocks: list[Block],
-                                   blk_bb: tuple[float, float, float, float],
-                                   min_width: float | None = None,
-                                   min_height: float | None = None) -> list[tuple[int, int]]:
-    """
-    Single-orientation MaxRects candidate generation -- thin composition of
-    `_maxrects_free_space` + `_maxrects_extract_candidates` (split out
-    2026-07-22 so `_place_blocks` can share the free-space replay across one
-    block's multiple orientations instead of calling this whole function
-    once per orientation; see `_maxrects_free_space`'s docstring). Kept as a
-    single entry point for any caller that just wants one orientation's
-    candidates without managing the two-step split itself.
-
-    min_width / min_height : optional, folded into the sliver-pruning
-    threshold as max(bw, min_width) -- a no-op here since bw (this call's
-    own single orientation) already dominates any smaller global minimum;
-    see `_maxrects_free_space`'s docstring for where this parameter
-    actually matters (the shared multi-orientation path in _place_blocks).
-    """
-    lx0, ly0, lx1, ly1 = blk_bb
-    bw = lx1 - lx0
-    bh = ly1 - ly0
-    sliver_w = max(bw, min_width) if min_width is not None else bw
-    sliver_h = max(bh, min_height) if min_height is not None else bh
-    free = _maxrects_free_space(bay_w, bay_h, placed_blocks, sliver_w, sliver_h)
-    return _maxrects_extract_candidates(free, blk_bb, bay_w, bay_h)
 
 
 # 2026-07-22: how many jittered positions to add per kept free rectangle,
@@ -2419,26 +2379,6 @@ def _place_blocks(
                         return (r[2] - r[0]) * (r[3] - r[1])
                     active_in_bay = sorted(active_in_bay, key=_block_area, reverse=True)
 
-                # 2026-07-22 (user-proposed, "safe subset of persistent
-                # MaxRects" -- see _maxrects_free_space's docstring for why
-                # sharing ACROSS blocks isn't sound but sharing across one
-                # block's own orientations is): all orientations of THIS
-                # block share the identical active_in_bay/r_time context, so
-                # replay the free-space split ONCE per bay here instead of
-                # once per orientation inside the loop below. Uses
-                # maxrects_min_width/height (the global minimum across every
-                # orientation of every block this whole _place_blocks call
-                # might place) as the sliver threshold -- safe because it's
-                # always <= this block's own per-orientation (bw, bh), so it
-                # can only keep MORE fragments than any single orientation
-                # strictly needs, never fewer; the per-orientation fit check
-                # still happens separately in _maxrects_extract_candidates.
-                if use_maxrects:
-                    _shared_free = _maxrects_free_space(
-                        bay.width, bay.height, active_in_bay,
-                        maxrects_min_width, maxrects_min_height,
-                    )
-
                 # 2026-07-22 bugfix: capping active_in_bay above bounds
                 # candidate-GENERATION cost, but each orientation still pays
                 # its own full _find_earliest_slot search against this bay's
@@ -2479,15 +2419,11 @@ def _place_blocks(
                     # per-instance choice, decided once by the caller.
                     # active_in_bay is computed (and, if use_maxrects,
                     # area-sorted) once per bay above, outside this
-                    # orientation loop -- reused as-is here. _shared_free
-                    # (the free-space replay) is ALSO computed once per bay
-                    # above (2026-07-22) -- only the cheap per-orientation
-                    # fit-check runs here now, see _maxrects_free_space's
-                    # docstring for why sharing across orientations (but not
-                    # across different blocks) is safe.
+                    # orientation loop -- reused as-is here.
                     if use_maxrects:
-                        candidates = _maxrects_extract_candidates(
-                            _shared_free, blk_bb, bay.width, bay.height,
+                        candidates = _candidate_positions_maxrects2(
+                            bay.width, bay.height, active_in_bay, blk_bb,
+                            min_width=maxrects_min_width, min_height=maxrects_min_height,
                         )
                     else:
                         candidates = _candidate_positions(
