@@ -451,6 +451,14 @@
     **최종 결론**: `max_source_blocks` 캡, `_justify_deadline`, `_aabb_gap_entry` 셋 다 무죄로 배제됐고, 남은 후보(`_repair`의 78% 컷오프+emergency-guarantee, `_improve`의 `known_result` 재사용)는 테스트 환경 신뢰도 문제로 이번 세션에서는 추가 분리를 보류 -- 사용자 판단으로 여기서 종결. **`b621af5`가 P3/P6(의 로컬 대응물인 prob_14/15/21/32/34)를 악화시킨 원인이라는 것 자체는 확정**이지만, 그 안의 정확한 단일 서브원인은 미확정으로 다음 세션 과제로 이월.
     **부수 발견**: prob_38/39/40(250블록, 이전에 P4-6 프록시로 추정했던 인스턴스)은 이번 비교에서 전부 6차가 더 나은 것으로 나와, **P3/P6과 비슷한 성격이 아님**이 확인됨 -- 실제 회귀 재현 인스턴스는 prob_14/15/21/32/34(100-250블록, 전부 300블록 미만)이고, 이 중 prob_32/34는 w1(지각 가중치)이 다른 넷보다 훨씬 낮고(3,333 vs 13K-29K) w3(선호도 가중치)는 훨씬 높은(533-600 vs 133-200) 공통점이 있음 -- P3/P6의 실제 성격에 대한 단서로 남겨둠.
 
+76. **CP-SAT 기반 reinsert() 프로토타입(`cpsat_reinsert.py`) 작성 -- 검증 중 `_cross_position_candidate`의 실제 경계검사 누락 버그 발견/수정 (2026-07-23)**
+    **배경**: `#74`에서 합의한 대로, Xpress의 O(K²) 명시적 쌍별 충돌 제약(wholebay의 오랜 K-스케일링 병목)을 CP-SAT의 interval 변수+`NoOverlap`으로 대체하는 프로토타입 설계. 사용자가 "불규칙 3D 다각형/크레인 간섭을 CP-SAT에서 어떻게 표현할 거냐"고 질문 -> **기하는 CP-SAT 안에서 전혀 모델링하지 않는다**고 답변: 후보 위치 생성(`_top_candidates_for_block`)과 충돌 판정(`check_collisions`/`_crane_conflict`, 둘 다 기존 Shapely 기반 함수 그대로 재사용)은 Xpress 버전과 완전히 동일하고, CP-SAT은 오직 "미리 계산된 충돌 사실을 어떻게 조합 제약으로 표현하느냐"만 다르게 함(같은 bay 안에서 AABB로 연결된 candidate 그룹을 찾아, 그 그룹의 모든 쌍이 실제로 충돌하는 완전그래프인 경우에만 시간축 `NoOverlap`으로 묶고, 아니면 안전하게 개별 쌍 제약으로 폴백).
+    **정확성 검증 중 발견한 실제 버그**: CP-SAT와 Xpress를 같은 재배치 시나리오로 비교하다가, Xpress 결과를 전체 솔루션에 끼워 넣고 `check_feasibility`로 재검증하면 가끔 infeasible이 나옴을 발견. 대부분은 테스트 하네스 자체 버그(EXIT 연산에 `bay_id` 누락, 같은 날짜 EXIT/ENTRY 순서 미보장, `greedyalgorithm()`을 `myalgorithm.algorithm()`의 안전 래퍼 없이 직접 호출해 기반 솔루션 자체가 이미 infeasible이었던 경우 등 3개)였지만, 그걸 다 고친 뒤에도 **"block 193 exceeds bay boundary"류의 진짜 위반**이 계속 남음 -- 직접 추적한 결과 `_cross_position_candidate`(#54, "블록 bi를 다른 블록 bj의 현재 자리에 넣어보자"는 swap 후보 주입)가 bj의 (x,y)를 bi의 **다른 orientation bbox**에 경계 검사 없이 그대로 재사용하고 있었음 -- 그 orientation의 로컬 bbox 최솟값이 음수(참조점이 도형 좌하단이 아닌 경우, 실제로 존재)면 결과 footprint가 bay 밖으로 나감(실측: prob_1에서 y_min=-2.79로 재현).
+    **영향 평가**: 이 모듈의 안전 설계상("잘못된 제안은 항상 reject되지 절대 잘못 accept 안 됨") 실제 운영에서는 무해했을 가능성이 높음 -- 다만 잘못된 후보 하나가 포함된 배치는 그 후보가 선택될 때마다 전체가 매번 reject되어 라운드를 낭비시킬 수 있어, 사소하지만 고칠 가치가 있는 실제 결함으로 판단.
+    **수정**: `_cross_position_candidate`에 `bay` 매개변수를 추가하고 4방향 경계 검사, 벗어나면 후보 생성을 아예 스킵(`None` 반환)하도록 변경. 호출부(`reinsert()`)도 `None` 처리 추가. 성능 영향 없음(K≤5 배치에서만 호출되는 실수 비교 4개 추가).
+    **검증**: 버그 재현 스크립트로 수정 전/후 직접 비교(수정 후 block 77이 bay 경계 안의 유효한 위치로 배치됨 확인), 40개 로컬 로버스트 40/40. `experiment/cross-position-candidate-bounds-fix` -> main merge.
+    **다음 단계**: 이 수정을 반영해 CP-SAT vs Xpress 정확성 비교 재실행 후, K=25/50/100+ 스케일링 실측으로 진행 예정.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
