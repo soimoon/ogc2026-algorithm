@@ -89,7 +89,7 @@ def _solve(prob_info: dict, timelimit: float, t_start: float) -> dict:
                              * _CHECK_FEASIBILITY_RESERVE_MULTIPLIER)
         reserve = max(timelimit * 0.1, estimated_reserve)
         inner_timelimit = max(1.0, timelimit - reserve)
-        best_solution, best_objective, n_attempts = _iterated_greedy_parallel(
+        best_solution, best_objective, n_attempts = _iterated_greedy_tiered(
             prob_info, baseline_greedy, check_feasibility,
             deadline=t_start + inner_timelimit,
         )
@@ -613,6 +613,283 @@ def _iterated_greedy_parallel(prob_info, baseline_greedy, check_feasibility, dea
     # silently deleting the history, per this file's own logging philosophy.
 
     return best_solution, best_objective, n_attempts
+
+
+# -----------------------------------------------------------------------------
+# Tiered parallel restart: shared construction, parallel Phase 3 (2026-07-24)
+# -----------------------------------------------------------------------------
+#
+# _iterated_greedy_parallel above has every worker redo Phase 1 + Repair +
+# 2.5/2.6 construction independently before its own Phase 3. Locally, EDD
+# (the default priority_rule) wins the plurality of instances (29-33/40 --
+# see _PRIORITY_RULE_CYCLE's own docstring), so most of those parallel
+# constructions converge close to the same place -- redundant CPU spent on
+# (mostly) the same work, especially costly on exactly the large/congested
+# instances (suspected P4-6 profile) where construction alone can consume
+# most of the budget, leaving little of anything to fan out afterward.
+#
+# _iterated_greedy_tiered does the ONE deterministic EDD/seed=0 construction
+# ONCE (baseline_greedy.greedyalgorithm(..., return_pre_improve_state=True)
+# stops right before its own Phase 3 call and hands back everything needed
+# to run it separately), then fans every other available core out into
+# Phase 3 (_improve) from that SAME shared, already-feasible base, each with
+# a different seed. This spends the whole parallel budget on the part of
+# the pipeline that benefits from more independent attempts, instead of
+# repeating the part that mostly doesn't.
+#
+# Falls back to _iterated_greedy_parallel (N independent full pipelines) if
+# the shared construction itself fails or doesn't reach a feasible base --
+# without a valid shared starting point there is nothing to fan out from,
+# and N independent attempts (each with its own from-scratch construction)
+# is exactly what that function already does. Every other failure mode
+# (process spawn, a worker's own _improve call, IPC) degrades the same way
+# -- one fewer candidate in the pool, never a crash or a TLE.
+
+
+def _tiered_phase3_worker(pre_state: dict, seed: int) -> tuple:
+    """
+    Runs baseline_greedy._improve() starting from a SHARED, already-verified
+    Phase 1 + Repair(+2.5/2.6) base (pre_state, from greedyalgorithm's
+    return_pre_improve_state=True), with this worker's own seed driving its
+    ALNS operator selection/annealing draws -- see
+    _iterated_greedy_tiered's module-level comment for the full rationale.
+
+    geometry_cache is deliberately NOT shared from pre_state here -- each
+    worker gets a fresh {} instead. pre_state's own geometry_cache (built
+    during the single shared construction pass) is still a valid starting
+    point in principle, but multiprocessing already pickles a fresh COPY of
+    it into each worker's own process regardless (no actual cross-process
+    sharing occurs either way), so reusing it wouldn't save anything -- a
+    fresh dict keeps each worker's cache scoped to exactly its own
+    exploration, matching every other geometry_cache usage's own safety
+    argument (never let a cache outlive/cross a single logical run).
+
+    Verifies the result with check_feasibility before returning, exactly
+    like _parallel_attempt_worker -- _improve() only ever runs on top of an
+    already-feasible base and is internally self-verifying, but this is the
+    same "never trust an unverified result across a process boundary"
+    discipline used everywhere else in this module.
+
+    Returns (seed, solution_or_None, objective_or_None); never raises.
+    """
+    try:
+        import baseline_greedy as _bg
+        from utils import check_feasibility as _cf
+        assignments = _bg._improve(
+            pre_state["prob_info"], dict(pre_state["assignments"]), pre_state["bays"],
+            pre_state["blocks_data"], pre_state["w1"], pre_state["w2"], pre_state["w3"],
+            pre_state["t_start"], pre_state["timelimit"],
+            atc_k=pre_state["atc_k"], annealing=pre_state["annealing"],
+            z2z3_modes=pre_state["z2z3_modes"], seed=seed,
+            max_per_block=pre_state["max_per_block"],
+            z1_lower_bound=pre_state["z1_lower_bound"], z23_relax=pre_state["z23_relax"],
+            use_maxrects=pre_state["use_maxrects"], known_result=pre_state["known_result"],
+            geometry_cache={},
+        )
+        solution = {"operations": _bg._build_operations(list(assignments.values()))}
+        result = _cf(pre_state["prob_info"], solution)
+        if not result["feasible"]:
+            return (seed, None, None)
+        return (seed, solution, result["objective"])
+    except Exception as exc:
+        print(f"[algorithm] tiered Phase-3 worker (seed={seed}) raised "
+              f"{type(exc).__name__}: {exc}")
+        return (seed, None, None)
+
+
+def _tiered_phase3_entry(result_queue, pre_state: dict, seed: int) -> None:
+    """Module-level (picklable) process entry point -- see
+    _parallel_attempt_entry, same wrapping rationale."""
+    try:
+        result = _tiered_phase3_worker(pre_state, seed)
+    except Exception:
+        result = (seed, None, None)
+    try:
+        result_queue.put(result)
+    except Exception:
+        pass
+
+
+def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadline: float):
+    """
+    Tiered parallel restart: one shared EDD/seed=0 construction (Phase 1
+    through Repair/2.5/2.6, run once in this process), then Phase 3
+    (_improve) fanned out across every other available core from that same
+    base. See this section's module-level comment for the full rationale.
+
+    Falls back to _iterated_greedy_parallel whenever: there isn't enough
+    budget to bother, only one usable core is available, the shared
+    construction itself raises or doesn't reach a feasible base, or
+    process-pool creation fails. Returns (best_solution_or_None,
+    best_objective_or_None, n_attempts) -- identical contract to
+    _iterated_greedy/_iterated_greedy_parallel, so _solve() needs no other
+    changes beyond calling this instead.
+    """
+    import time
+    import multiprocessing as mp
+
+    def _fallback():
+        return _iterated_greedy_parallel(prob_info, baseline_greedy, check_feasibility, deadline)
+
+    if mp.current_process().name != "MainProcess":
+        return _fallback()
+
+    remaining = deadline - time.time()
+    if remaining < _PARALLEL_MIN_BUDGET:
+        return _fallback()
+
+    n_cores = _os.cpu_count() or 1
+    n_slots = max(1, min(_PARALLEL_MAX_WORKERS, n_cores))
+    if n_slots <= 1:
+        return _fallback()
+
+    # -- Step 1: shared construction, ONCE, in this (main) process. --------
+    try:
+        pre_state = baseline_greedy.greedyalgorithm(
+            prob_info, timelimit=remaining, seed=0, priority_rule="edd",
+            return_pre_improve_state=True,
+        )
+    except Exception as exc:
+        print(f"[algorithm] tiered: shared construction raised {type(exc).__name__}: "
+              f"{exc} -- falling back to N-independent-pipeline parallel restart")
+        return _fallback()
+
+    pre_state["prob_info"] = prob_info
+    base_result = pre_state.get("known_result")
+    if base_result is None:
+        # known_result (last_verified_result inside greedyalgorithm) can be
+        # None even when assignments IS actually feasible -- e.g. _repair's
+        # own final force-place guarantee mutated assignments after its
+        # last verified check, deliberately without re-verifying (see
+        # _repair's own comment on why: that recheck would cost as much as
+        # the guarantee itself, ~19s on a large instance, for confirmation
+        # Phase 2.5/2.6/3 would give for free moments later anyway).
+        # Exactly this force-place path fires more often on large/congested
+        # instances -- precisely the ones this whole tiered feature exists
+        # to help -- so treating "unverified" as "infeasible" here would
+        # make it fall back to the less-efficient N-independent path
+        # disproportionately often on its own best-case instances. One
+        # fresh check costs the same as _improve's own internal fallback
+        # would have paid anyway (known_result=None there triggers the
+        # identical recompute) -- see _improve's own known_result docstring.
+        base_sol = {"operations": baseline_greedy._build_operations(
+            list(pre_state["assignments"].values()))}
+        base_result = check_feasibility(prob_info, base_sol)
+        pre_state["known_result"] = base_result
+    if not base_result.get("feasible"):
+        print(f"[algorithm] tiered: shared construction did not reach a feasible base "
+              f"-- falling back to N-independent-pipeline parallel restart")
+        return _fallback()
+
+    remaining_after_construct = deadline - time.time()
+    if remaining_after_construct < _PARALLEL_MIN_BUDGET:
+        # Construction alone used (almost) the whole budget -- nothing left
+        # to usefully fan out. The base itself is still a fully verified
+        # feasible result (base_result), so return it as-is rather than
+        # spending any of the little time left on process-spawn overhead
+        # for a Phase 3 pass that would barely run anyway.
+        print(f"[algorithm] tiered: only {remaining_after_construct:.1f}s left after shared "
+              f"construction -- returning the base as-is (no Phase-3 fan-out)")
+        sol = {"operations": baseline_greedy._build_operations(
+            list(pre_state["assignments"].values()))}
+        return sol, base_result["objective"], 1
+
+    # Each Phase-3 worker's own budget/clock -- t_start reset to now (not
+    # the shared construction's own t_start) so _improve's internal
+    # timelimit-relative deadline math is correct for THIS remaining window,
+    # not double-counting the time construction already spent.
+    pre_state["timelimit"] = remaining_after_construct
+    pre_state["t_start"] = time.time()
+
+    n_workers = n_slots - 1  # main process runs its own Phase-3 chain too
+
+    available = mp.get_all_start_methods()
+    start_method = "fork" if "fork" in available else "spawn"
+
+    procs = []
+    result_queue = None
+    try:
+        ctx = mp.get_context(start_method)
+        result_queue = ctx.Queue()
+        for i in range(n_workers):
+            worker_seed = 1000 + i  # distinct from the main process's own seed=0 chain below
+            p = ctx.Process(
+                target=_tiered_phase3_entry,
+                args=(result_queue, pre_state, worker_seed),
+                daemon=True,
+            )
+            p.start()
+            procs.append(p)
+    except Exception as exc:
+        print(f"[algorithm] tiered: Phase-3 worker spawn failed ({type(exc).__name__}: "
+              f"{exc}) -- using the shared base as-is")
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        sol = {"operations": baseline_greedy._build_operations(
+            list(pre_state["assignments"].values()))}
+        return sol, base_result["objective"], 1
+
+    print(f"[algorithm] tiered: shared EDD construction done ({remaining - remaining_after_construct:.1f}s), "
+          f"{len(procs)} Phase-3 worker(s) + main dispatched (start_method={start_method}, "
+          f"{n_cores} core(s) detected), timelimit={remaining_after_construct:.1f}s each")
+
+    # Main process runs its own Phase-3 chain concurrently (seed=0), using
+    # its own core instead of sitting idle.
+    candidates: list[tuple[int, dict, float]] = [(0, {"operations": baseline_greedy._build_operations(
+        list(pre_state["assignments"].values()))}, base_result["objective"])]
+    try:
+        w_seed, w_sol, w_obj = _tiered_phase3_worker(pre_state, seed=0)
+        if w_sol is not None:
+            candidates.append((w_seed, w_sol, w_obj))
+    except Exception as exc:
+        print(f"[algorithm] tiered: main Phase-3 chain raised {type(exc).__name__}: {exc}")
+
+    collect_grace = min(_PARALLEL_COLLECT_GRACE, remaining_after_construct * 0.1)
+    collect_deadline = deadline + collect_grace
+    n_collected = 0
+    try:
+        while n_collected < len(procs):
+            remaining_wait = collect_deadline - time.time()
+            if remaining_wait <= 0:
+                print(f"[algorithm] tiered: collection deadline hit with "
+                      f"{len(procs) - n_collected} Phase-3 worker(s) still outstanding")
+                break
+            try:
+                w_seed, w_sol, w_obj = result_queue.get(timeout=remaining_wait)
+            except Exception:
+                print(f"[algorithm] tiered: collection timed out with "
+                      f"{len(procs) - n_collected} Phase-3 worker(s) still outstanding")
+                break
+            n_collected += 1
+            if w_sol is None:
+                print(f"[algorithm] tiered Phase-3 worker (seed={w_seed}): "
+                      f"infeasible or failed -- discarded")
+                continue
+            candidates.append((w_seed, w_sol, w_obj))
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=2.0)
+        if result_queue is not None:
+            try:
+                result_queue.close()
+                result_queue.join_thread()
+            except Exception:
+                pass
+
+    best_seed, best_solution, best_objective = candidates[0]
+    for cand_seed, cand_sol, cand_obj in candidates[1:]:
+        if cand_obj < best_objective - 1e-6:
+            best_seed, best_solution, best_objective = cand_seed, cand_sol, cand_obj
+    print(f"[algorithm] tiered: {len(candidates)} Phase-3 chain(s) collected (including the "
+          f"shared base itself), best from seed={best_seed} objective={best_objective:.0f}")
+
+    return best_solution, best_objective, len(candidates)
 
 
 def _emergency_fallback(prob_info: dict) -> dict:

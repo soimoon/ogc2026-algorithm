@@ -1720,7 +1720,8 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
                     seed: int | None = 0,
                     construction_mode: str = "serial",
                     right_justify: bool = True,
-                    z23_relax: bool = True) -> dict:
+                    z23_relax: bool = True,
+                    return_pre_improve_state: bool = False) -> dict:
     """
     ATC/EDD + Best-Fit Greedy algorithm with post-hoc feasibility repair and
     an anytime tardiness-improvement pass.
@@ -2244,6 +2245,35 @@ def greedyalgorithm(prob_info: dict, timelimit: float,
         else:
             last_verified_result = pre_rj_result
             print("[Greedy] Right-justify+re-left: skipped (pre-sweep state not feasible)")
+
+    # 2026-07-24 (user-proposed, "tiered" parallel restart -- see
+    # myalgorithm._iterated_greedy_tiered): returns everything needed to
+    # call _improve() separately, WITHOUT running it here. Motivation: the
+    # N-independent-full-pipeline parallel restart (myalgorithm.
+    # _iterated_greedy_parallel) has every worker redo this exact
+    # Phase 1 + Repair + 2.5/2.6 construction independently -- locally,
+    # EDD (priority_rule="edd", the default) wins the plurality of
+    # instances (29-33/40, see _PRIORITY_RULE_CYCLE's own docstring), so
+    # most of those repeated constructions converge to close to the same
+    # place, redundantly spending cores on (mostly) the same work instead
+    # of on Phase 3 exploration diversity. Doing this ONE deterministic
+    # EDD/seed=0 construction ONCE, then fanning every available core out
+    # into Phase 3 (_improve) from this SAME shared base with different
+    # seeds, spends the whole parallel budget on the part of the pipeline
+    # that actually benefits from more attempts. Every value returned here
+    # is exactly what the omitted _improve() call below would have used as
+    # its own arguments -- see that call for the one-to-one correspondence.
+    # False (default) is a complete no-op -- returns the normal final
+    # solution dict exactly as before this parameter existed.
+    if return_pre_improve_state:
+        return {
+            "assignments": assignments, "bays": bays, "blocks_data": blocks_data,
+            "w1": w1, "w2": w2, "w3": w3, "t_start": t_start, "timelimit": timelimit,
+            "atc_k": atc_k, "annealing": annealing, "z2z3_modes": z2z3_modes,
+            "max_per_block": xpress_max_per_block, "z1_lower_bound": z1_lower_bound,
+            "z23_relax": z23_relax, "use_maxrects": use_maxrects,
+            "known_result": last_verified_result, "geometry_cache": geometry_cache,
+        }
 
     # -- Phase 3: improve feasible-but-tardy assignments with leftover time ---
     print(f"[Greedy] {'-' * 56}")
