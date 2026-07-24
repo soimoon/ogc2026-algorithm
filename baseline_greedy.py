@@ -942,6 +942,31 @@ def _find_earliest_slot(new_blk: Block,
         #       when b_other was placed, which didn't include new_blk yet.
         #   (b) b_other's *entry* falls inside new_blk's window (possible
         #       since blocks aren't necessarily placed in entry-time order).
+        #
+        # 2026-07-24 bugfix (found during code review, then measured before
+        # trusting -- see notes/algorithm_overview.md): the three branches
+        # below (b_other entering inside the window, exiting inside the
+        # window, or fully nested) leave exactly one combination of a
+        # genuinely time-overlapping b_other uncovered: a_other == entry
+        # (b_other enters at the EXACT same instant as new_blk's own
+        # candidate entry -- excluded from "entry < a_other" by the strict
+        # inequality) together with e_other > exit_t (so it's not nested
+        # either, since that needs e_other <= exit_t). Proven exhaustively:
+        # for any b_other whose interval overlaps [entry, exit_t), every
+        # other (a_other, e_other) combination is either caught by one of
+        # the three branches here or was already excluded by the function's
+        # own present_at_entry check above (a_other < entry falls under
+        # Stage-2's a<entry<e). check_feasibility's own Stage 4 does NOT
+        # share Stage 2/3's same-instant-entry exclusion (it checks any pair
+        # whose time intervals overlap at all, regardless of ordering), so a
+        # real collision here would still surface eventually via repair --
+        # measured directly first (analysis/measure_stage4_gap.py, all 40
+        # local instances, 20s each): the combination itself arose 4,672
+        # times across 1.53M calls, but check_collisions never once found an
+        # actual overlap in any of them -- construction-time exposure is
+        # real but empirically harmless on every local instance. Closed the
+        # gap anyway since the fix is free (same check_collisions pattern as
+        # the nested branch, only reached in this already-rare combination).
         s4_blocked = False
         for b_other, (a_other, e_other) in zip(relevant_blocks, relevant_schedule):
             if entry < a_other < exit_t:
@@ -962,6 +987,17 @@ def _find_earliest_slot(new_blk: Block,
                 # neither check above fires (no boundary of b_other's falls
                 # *strictly* inside), so still need the steady-state
                 # same-level check for pure coexistence.
+                if check_collisions(bay, [new_blk, b_other]):
+                    s4_blocked = True
+                    break
+            if a_other == entry and e_other > exit_t:
+                # Same-instant entry, b_other outlives new_blk -- the one
+                # combination none of the three branches above cover (see
+                # 2026-07-24 comment above this loop). Pure steady-state
+                # check, same as the nested branch: neither block's
+                # boundary falls strictly inside the other's window, so
+                # there's no crane-sweep obstruction to check, just
+                # coexistence.
                 if check_collisions(bay, [new_blk, b_other]):
                     s4_blocked = True
                     break
