@@ -781,6 +781,106 @@ _ISLAND_N_SEGMENTS = 3
 # unsegmented round instead, identical to before this feature existed.
 _ISLAND_MIN_SEGMENT_BUDGET = 10.0
 
+# 2026-07-24 (hybrid fix, after an A/B against the actual 9th submission's
+# code showed this whole tiered/island feature LOSING on prob_1 (8,041 ->
+# 68,633, 8.5x worse) and prob_18 (174,788 -> 194,062, ~11% worse), both
+# deterministic across repeats): every Phase-3 worker above only ever
+# refines the ONE shared EDD/seed=0 construction. ALNS moves (_improve's
+# operators) are local, feasible-preserving edits -- they cannot reproduce
+# what a DIFFERENT Phase-1 construction reaches, since that changes the
+# initial placement/order globally, not incrementally.
+#
+# First attempt at a fix reserved one worker slot for a single alternate-
+# construction attempt with a different priority_rule (area_slack). Empirically
+# verified NOT to fix either regression: probing the 9th submission's own
+# sequential _iterated_greedy directly on both instances showed the winning
+# basin comes from priority_rule="edd" with seed=1 (the SECOND restart
+# attempt, same rule as the shared base) -- NOT a different rule at all:
+#   prob_1:  restart 1 (seed=0, edd)=68,633   restart 2 (seed=1, edd)=8,041 (best)   restart 3 (seed=2, edd)=90,809
+#   prob_18: restart 1 (seed=0, edd)=194,062  restart 2 (seed=1, edd)=174,788 (best) restart 3 (seed=2, edd)=197,235
+# i.e. Phase-1 EDD construction is NOT seed-invariant (tie-breaking among
+# same-due-date blocks alone produces an 8.5x objective swing here) -- the
+# tiered design's whole premise that "EDD converges to basically the same
+# place regardless of seed, so sharing one seed=0 base is safe" is simply
+# wrong for these instances. A single area_slack attempt can't recover a
+# same-rule-different-seed basin, and area_slack itself is unreliable
+# besides -- on prob_18 it scored 66,041,060 (vs the 174,788 that won).
+#
+# Fix: instead of one fixed (seed, rule) attempt, the alt slot runs the
+# EXISTING _iterated_greedy restart loop (unmodified -- cycles
+# _PRIORITY_RULE_CYCLE with an increasing seed each attempt, same as the old
+# purely-sequential path) inside its own process for whatever's left of the
+# shared deadline. On both regressed instances the old sequential path only
+# ever completed 3-4 full attempts in a 90s budget before finding its best
+# -- giving one full core to that exact same loop (_alt_restart_entry below)
+# reproduces it directly, instead of trying to approximate it with a single
+# shot at a different rule.
+
+
+def _alt_restart_entry(result_queue, prob_info: dict, deadline: float) -> None:
+    """
+    Module-level (picklable) process entry point for the alt-construction
+    slot -- see the module-level comment above for why this exists and why
+    it runs the full _iterated_greedy restart loop rather than one attempt.
+
+    Passed the SAME absolute `deadline` _iterated_greedy_tiered itself uses
+    (not a relative timelimit computed in the parent before spawn) --
+    _iterated_greedy reads time.time() itself on every iteration, inside
+    this child process, so it already anchors correctly to the true wall
+    clock without needing a spawn-overhead buffer subtracted in the parent
+    first (unlike _parallel_attempt_worker's worker_timelimit, which IS a
+    relative value handed to greedyalgorithm's own t_start-anchored clock).
+
+    Returns (solution_or_None, objective_or_None, n_attempts) on the queue;
+    never raises.
+    """
+    try:
+        import baseline_greedy as _bg
+        from utils import check_feasibility as _cf
+        solution, objective, n_attempts = _iterated_greedy(prob_info, _bg, _cf, deadline)
+    except Exception as exc:
+        print(f"[algorithm] tiered: alt restart-loop raised {type(exc).__name__}: {exc}")
+        solution, objective, n_attempts = None, None, 0
+    try:
+        result_queue.put((solution, objective, n_attempts))
+    except Exception:
+        pass
+
+
+# 2026-07-24 (weight-adaptive alt slot, after re-verifying the restart-loop
+# fix above against the 9th submission): prob_1/prob_14/prob_18/prob_40 (w3
+# share of w1+w2+w3 all under 2%) all tied or improved with the restart-loop
+# alt slot -- prob_1 and prob_18 in particular now match the 9th submission
+# EXACTLY (8,041 and 174,788 respectively), confirming the seed=1/edd basin
+# diagnosis. But prob_32 and prob_34 -- the two local instances presumed
+# closest to P3/P6 (see canary_quality_check.py's own CANARY_SET), both with
+# a w3 share an order of magnitude higher (13-15%) than every other canary
+# instance -- regressed under the SAME restart-loop alt slot (prob_34 by as
+# much as ~31% in one run, well outside that instance's previously observed
+# noise band of a few percent).
+#
+# Mechanically this tracks: the restart-loop's _PRIORITY_RULE_CYCLE is
+# mostly "edd" (3 of 5 slots), which searches for a better Z1(tardiness)
+# basin specifically -- exactly what a w1-dominant instance needs more of,
+# and largely wasted work on a w3-elevated instance where the ALNS
+# preference/balance operators inside tiered/island Phase-3 (which the alt
+# slot's core is NOT spent on) matter more. Separately, the ORIGINAL single-
+# attempt alt slot (priority_rule="area_slack", one shot, no restart loop --
+# see this function's own history above) had already turned prob_32 from a
+# regression into a win before the restart-loop replaced it -- evidence that
+# area_slack specifically (not edd-cycling) is the useful alternate basin
+# for this w3-elevated profile, not just "more attempts of anything".
+#
+# Rather than pick one alt-slot strategy for every instance, use whichever
+# one the evidence above actually supports for that instance's own weight
+# profile: the edd-focused restart loop for w1-dominant instances (recovers
+# prob_1/prob_18 exactly), the single area_slack attempt for w3-elevated
+# ones (already a proven win on prob_32, and only ~0.4%/noise-level on
+# prob_34 -- versus the restart loop's ~31% regression there).
+_TIERED_ALT_W3_SHARE_THRESHOLD = 0.05
+_TIERED_ALT_SINGLE_SEED = 5000
+_TIERED_ALT_SINGLE_RULE = "area_slack"
+
 
 def _tiered_phase3_round(pre_state: dict, n_workers: int, deadline: float,
                          seed_base: int) -> list[tuple[int, dict, float]]:
@@ -895,8 +995,12 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
     """
     Tiered parallel restart: one shared EDD/seed=0 construction (Phase 1
     through Repair/2.5/2.6, run once in this process), then Phase 3
-    (_improve) fanned out across every other available core from that same
-    base. See this section's module-level comment for the full rationale.
+    (_improve) fanned out across most of the remaining cores from that same
+    base -- EXCEPT one core, reserved for an independent alt-construction
+    restart loop (_alt_restart_entry) that explores different seeds/rules
+    from scratch, since the shared base's own seed/rule choice can itself
+    be a bad basin _improve can never fully escape. See this section's
+    module-level comment (above _alt_restart_entry) for the full rationale.
 
     Falls back to _iterated_greedy_parallel whenever: there isn't enough
     budget to bother, only one usable core is available, the shared
@@ -909,7 +1013,25 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
     import time
     import multiprocessing as mp
 
-    def _fallback():
+    def _fallback(alt_proc=None, alt_queue=None):
+        # alt_proc/alt_queue are only ever non-None after Step 0 below has
+        # already dispatched the alternate-construction attempt -- clean it
+        # up here too so no path through this function can ever leave it
+        # running past return, matching every other process-cleanup
+        # discipline in this module.
+        if alt_proc is not None:
+            try:
+                if alt_proc.is_alive():
+                    alt_proc.terminate()
+                alt_proc.join(timeout=2.0)
+            except Exception:
+                pass
+        if alt_queue is not None:
+            try:
+                alt_queue.close()
+                alt_queue.join_thread()
+            except Exception:
+                pass
         return _iterated_greedy_parallel(prob_info, baseline_greedy, check_feasibility, deadline)
 
     if mp.current_process().name != "MainProcess":
@@ -924,6 +1046,54 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
     if n_slots <= 1:
         return _fallback()
 
+    # -- Step 0: dispatch the independent alternate-construction attempt
+    # CONCURRENTLY with the shared construction below -- see the module-
+    # level comment above _alt_restart_entry for the restart-loop's own
+    # rationale, and the comment above _TIERED_ALT_W3_SHARE_THRESHOLD for
+    # why the STRATEGY itself is picked per-instance from the weight
+    # profile (edd-focused restart loop for w1-dominant instances, a
+    # single area_slack attempt for w3-elevated ones). Passed this
+    # function's own absolute `deadline` directly in the restart-loop case
+    # (see _alt_restart_entry's own docstring for why no spawn-overhead
+    # buffer is needed there); the single-attempt case still needs one,
+    # matching _parallel_attempt_worker's usage elsewhere. Never blocks: if
+    # spawn fails, alt_proc/alt_queue stay None and everything below
+    # degrades to exactly the pre-fix behaviour (all n_slots-1 remaining
+    # slots go to tiered/island refinement).
+    alt_proc = None
+    alt_queue = None
+    weights = prob_info.get("weights", {})
+    w1_plus = weights.get("w1", 0) + weights.get("w2", 0) + weights.get("w3", 0)
+    w3_share = (weights.get("w3", 0) / w1_plus) if w1_plus > 0 else 0.0
+    alt_mode = "restart_loop" if w3_share < _TIERED_ALT_W3_SHARE_THRESHOLD else "single_attempt"
+    try:
+        alt_available = mp.get_all_start_methods()
+        alt_start_method = "fork" if "fork" in alt_available else "spawn"
+        alt_ctx = mp.get_context(alt_start_method)
+        alt_queue = alt_ctx.Queue()
+        if alt_mode == "restart_loop":
+            alt_proc = alt_ctx.Process(
+                target=_alt_restart_entry,
+                args=(alt_queue, prob_info, deadline),
+                daemon=True,
+            )
+        else:
+            alt_worker_timelimit = max(1.0, remaining - _PARALLEL_SPAWN_OVERHEAD_BUFFER)
+            alt_proc = alt_ctx.Process(
+                target=_parallel_attempt_entry,
+                args=(alt_queue, prob_info, alt_worker_timelimit,
+                      _TIERED_ALT_SINGLE_SEED, _TIERED_ALT_SINGLE_RULE),
+                daemon=True,
+            )
+        alt_proc.start()
+        print(f"[algorithm] tiered: alt slot mode={alt_mode} (w3_share={w3_share:.2%}, "
+              f"threshold={_TIERED_ALT_W3_SHARE_THRESHOLD:.0%})")
+    except Exception as exc:
+        print(f"[algorithm] tiered: alternate-construction spawn failed "
+              f"({type(exc).__name__}: {exc}) -- proceeding without it")
+        alt_proc = None
+        alt_queue = None
+
     # -- Step 1: shared construction, ONCE, in this (main) process. --------
     try:
         pre_state = baseline_greedy.greedyalgorithm(
@@ -933,7 +1103,7 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
     except Exception as exc:
         print(f"[algorithm] tiered: shared construction raised {type(exc).__name__}: "
               f"{exc} -- falling back to N-independent-pipeline parallel restart")
-        return _fallback()
+        return _fallback(alt_proc, alt_queue)
 
     pre_state["prob_info"] = prob_info
     base_result = pre_state.get("known_result")
@@ -960,7 +1130,7 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
     if not base_result.get("feasible"):
         print(f"[algorithm] tiered: shared construction did not reach a feasible base "
               f"-- falling back to N-independent-pipeline parallel restart")
-        return _fallback()
+        return _fallback(alt_proc, alt_queue)
 
     base_sol = {"operations": baseline_greedy._build_operations(
         list(pre_state["assignments"].values()))}
@@ -970,7 +1140,11 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
     n_attempts_total = 1  # the shared base itself always counts as one
 
     remaining_after_construct = deadline - time.time()
-    n_workers = n_slots - 1  # additional spawned workers beyond the main process's own chain each round
+    # additional spawned workers beyond the main process's own chain each
+    # round -- one slot is already reserved for the alternate-construction
+    # attempt dispatched in Step 0 above (if it's actually running).
+    n_reserved_for_alt = 1 if alt_proc is not None else 0
+    n_workers = max(0, n_slots - 1 - n_reserved_for_alt)
 
     # Island-model migration (see the module-level comment above
     # _tiered_phase3_round) only when there's enough total budget that
@@ -1041,6 +1215,57 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
 
     print(f"[algorithm] tiered: {n_attempts_total} Phase-3 attempt(s) total across "
           f"{n_segments} round(s), best from seed={global_best_seed} objective={global_best_obj:.0f}")
+
+    # -- Step N: collect the alternate-construction attempt dispatched back
+    # in Step 0 (whichever alt_mode was chosen) -- it has been running
+    # concurrently this whole time against the SAME absolute deadline this
+    # whole function got, so it should already be at or near done. Same
+    # proportional-with-a-ceiling grace as every other collection point in
+    # this module (see _PARALLEL_COLLECT_GRACE's own docstring) -- bounds
+    # worst-case added wall-clock even if it's somehow still running.
+    #
+    # The two alt_mode targets return different tuple shapes on the queue
+    # (_alt_restart_entry: (solution, objective, n_attempts);
+    # _parallel_attempt_entry: (seed, priority_rule, solution, objective),
+    # matching _iterated_greedy_parallel's own usage) -- normalized to a
+    # common (alt_sol, alt_obj, alt_n_attempts, alt_label) shape here so the
+    # merge/print logic below doesn't need to care which one ran.
+    if alt_proc is not None:
+        alt_grace = min(_PARALLEL_COLLECT_GRACE, remaining * 0.1)
+        alt_wait = max(0.0, (deadline + alt_grace) - time.time())
+        try:
+            if alt_mode == "restart_loop":
+                alt_sol, alt_obj, alt_n_attempts = alt_queue.get(timeout=alt_wait)
+                alt_label = "alt restart-loop"
+            else:
+                alt_seed, alt_rule, alt_sol, alt_obj = alt_queue.get(timeout=alt_wait)
+                alt_n_attempts = 1
+                alt_label = f"alt single-attempt (seed={alt_seed}, rule={alt_rule})"
+            n_attempts_total += alt_n_attempts
+            if alt_sol is None:
+                print(f"[algorithm] tiered: {alt_label} ({alt_n_attempts} attempt(s)) "
+                      f"found nothing feasible -- discarded")
+            elif alt_obj < global_best_obj - 1e-6:
+                print(f"[algorithm] tiered: {alt_label} ({alt_n_attempts} attempt(s)) "
+                      f"objective={alt_obj:.0f} -- NEW global best (was {global_best_obj:.0f})")
+                global_best_sol, global_best_obj = alt_sol, alt_obj
+            else:
+                print(f"[algorithm] tiered: {alt_label} ({alt_n_attempts} attempt(s)) "
+                      f"objective={alt_obj:.0f} (global best stays {global_best_obj:.0f})")
+        except Exception:
+            print(f"[algorithm] tiered: alt slot collection timed out -- discarded")
+        finally:
+            try:
+                if alt_proc.is_alive():
+                    alt_proc.terminate()
+                alt_proc.join(timeout=2.0)
+            except Exception:
+                pass
+            try:
+                alt_queue.close()
+                alt_queue.join_thread()
+            except Exception:
+                pass
 
     return global_best_sol, global_best_obj, n_attempts_total
 
