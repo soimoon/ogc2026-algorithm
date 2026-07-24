@@ -293,31 +293,32 @@ def _iterated_greedy(prob_info, baseline_greedy, check_feasibility, deadline: fl
 
 import os as _os  # noqa: E402 -- module-level import used by the constants/helpers below
 
-# 2026-07-24 (user-proposed "N-1 core rule", after an A/B against this
-# feature's own first cut at 4 workers surfaced a real contention cost --
-# see notes/algorithm_overview.md): was 4, matching the competition's <=4
-# CPU core cap literally -- but a fair, interleaved A/B (same instance, same
-# machine state, sequential immediately followed by 4-way parallel) showed
-# parallel losing to plain sequential on 13/40 local instances, a few
-# severely (prob_35: 3.3x worse, prob_9: 1.6x worse), even on an 18-core dev
-# machine with no shortage of raw cores. Mechanism (plausible, not fully
-# proven): every worker's internal Phase-1/Repair/Improve deadlines are
-# wall-clock (time.time())-based and assume normal, uncontended throughput;
-# shared memory-bandwidth/cache contention from 4 simultaneous CPU-bound
-# processes (not core *availability*, which isn't scarce even at 4-on-4 on
-# the real server) can slow each worker's REAL computation rate below what
-# its own deadline logic assumes, pushing some workers into early
-# truncation/force-place fallback they would not have hit running alone --
-# exactly the failure mode the "keep strictly best across chains" selection
-# can't fully hide if it happens to ALL chains at once. Reserving one core
-# (3 workers, not 4) is the cheap, low-risk first mitigation: it directly
-# reduces contention at the source without touching any of the deadline
-# logic itself (a deeper tick/ops-based rewrite of Phase 1/Repair was
-# considered and deliberately deferred -- touches the same wall-clock-
-# threaded code the sequential path also depends on, far larger risk for
-# an unconfirmed payoff). Re-validate with the same interleaved A/B before
-# trusting this over the 4-worker cut it replaces.
-_PARALLEL_MAX_WORKERS = 3
+# 2026-07-24: 4, matching the competition's <=4 CPU core cap. History: an
+# earlier A/B against this feature's first cut at 4 workers surfaced a real
+# contention cost (parallel losing to plain sequential on 13/40 local
+# instances, a couple severely) even on an 18-core dev machine, leading to a
+# "N-1 core rule" experiment at 3 workers. Re-tested with a proper repeated
+# (2x) trial on the 10-instance canary set: 3-worker vs 4-worker came back
+# genuinely mixed (2 vs 3 wins, 2 ties across 7 completed instances, most
+# margins low-confidence/overlapping) -- no clear winner either way, so the
+# original contention concern did not reproduce as a decisive effect once
+# measured properly. Given that, and that this whole feature's actual
+# value driver (parallel-vs-sequential, not 3-vs-4-workers specifically)
+# already showed a clear net-positive fair A/B (24 wins/13 losses/3 ties
+# across all 40 local instances), the tie-break went to using the full
+# competition-allowed core budget rather than leaving one idle on an
+# unconfirmed contention hypothesis. Two safety gaps this decision
+# specifically depended on closing first (both fixed the same day, see
+# their own comments): the quality-floor gap in _iterated_greedy_tiered
+# (a slow-server scenario could previously skip Phase 3 entirely, worse
+# than plain sequential -- fixed to always attempt one local chain
+# regardless of remaining budget) and the _PARALLEL_COLLECT_GRACE
+# proportional cap (bounds worst-case total elapsed regardless of
+# timelimit size). Peak aggregate memory measured at ~226MB for a 3-process
+# run on the largest local instance (250 blocks) -- trivial next to the
+# competition's 16GB cap, though unconfirmed at whatever scale the actual
+# hidden P4-6 instances turn out to be.
+_PARALLEL_MAX_WORKERS = 4
 
 # Same recipe already validated for _iterated_greedy's sequential restart
 # cycle (_PRIORITY_RULE_CYCLE above) -- EDD gets the majority of slots
@@ -334,19 +335,16 @@ _PARALLEL_MAX_WORKERS = 3
 # to weight this any more conservatively toward EDD than the already-
 # validated sequential recipe already does.
 #
-# 2026-07-24 (N-1 core rule, see _PARALLEL_MAX_WORKERS' comment): trimmed
-# from 4 slots to 3 alongside the worker-count cut. Deliberately NOT just
-# `_PARALLEL_ATTEMPT_PLAN[:3]` of the old 4-slot list -- that would have
-# silently dropped area_slack entirely (slot 4 was its only appearance),
-# losing all construction-rule diversity and leaving 3 identically-ruled
-# EDD attempts differing only by seed. Keeping one area_slack slot
-# preserves the same "mostly EDD, still get a structurally different
-# construction to fall back on" mix the 4-worker version had, just with one
-# fewer same-rule EDD seed.
+# 2026-07-24: restored to 4 slots alongside _PARALLEL_MAX_WORKERS going
+# back to 4 (see that constant's comment for the full history -- was
+# briefly trimmed to 3 during the "N-1 core rule" experiment, which did not
+# hold up under a proper repeated-trial re-test). 3xEDD + 1xarea_slack,
+# matching this feature's original mix.
 _PARALLEL_ATTEMPT_PLAN = [
     (0, "edd"),
     (1, "edd"),
-    (2, "area_slack"),
+    (2, "edd"),
+    (3, "area_slack"),
 ]
 
 # Below this much remaining wall-clock budget, process-spawn overhead
