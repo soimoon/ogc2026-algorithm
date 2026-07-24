@@ -10,7 +10,7 @@ Distinct from analysis/robustness_check.py (2026-07-24 discussion,
 user-proposed split): robustness_check.py runs ALL 40 local instances at a
 SHORT budget (~20s) to catch crashes/infeasible/TLE before every submission
 -- cheap, run every time, feasibility-only. This script runs a much
-SMALLER set (8 instances) at a LONGER, more realistic budget (default
+SMALLER set (10 instances) at a LONGER, more realistic budget (default
 120s, enough for ALNS to actually converge) and, critically, PERSISTS every
 run's result to a JSON-Lines history file (CANARY_HISTORY_PATH) so quality
 regressions -- not just infeasibility -- are visible across code changes
@@ -52,6 +52,29 @@ _INSTANCE_SEARCH_DIRS = [
 # 2026-07-24 (user-approved set). "target"/"confidence"/"note" are exactly
 # the reasoning from notes/experiments.md's cross-referencing session --
 # update THERE first if the hypothesis changes, then mirror here.
+#
+# 2026-07-24 (later, +2 during the parallel-restart worker-count
+# investigation): 8 -> 10, picked by scanning all 40 local instances'
+# w1/w2/w3/block/bay profiles for anything that strengthens or diversifies
+# the existing 8, not just to pad the count.
+#   - prob_36: near-exact weight-profile AND size match to prob_40
+#     (w1=667, w2=1, w3=13, 250 blocks, 4 bays -- identical on every one of
+#     those axes). prob_40 was previously the SOLE P4 candidate at "low"
+#     confidence (a congestion guess, not a weight-profile match like every
+#     other entry here) -- having a second instance land in the exact same
+#     rare corner of weight-space (w1=667 is the lowest in the entire local
+#     set, shared by only prob_25/36/40) turns that into an actual cluster
+#     match, the same style of evidence prob_32/34's P3/P6 pairing already
+#     uses. Raises P4 confidence from "low" to "medium".
+#   - prob_20: weak justification, included for coverage rather than a
+#     confident P-target guess -- the ONLY 5-bay instance in the entire
+#     local 40 (every other local instance has 2-4); already noted as
+#     structurally "이질적" when P5's own grouping explicitly excluded it.
+#     No hidden instance has been hypothesized to be 5-bay specifically,
+#     but the canary set otherwise has zero representation of that regime.
+#     Kept at "low" confidence deliberately -- treat its results as
+#     structural-diversity coverage for the worker-count experiment, not
+#     as a P-target signal.
 CANARY_SET = [
     {"instance": "prob_1",  "target": "P1",    "confidence": "medium",
      "note": "구성 다양화 민감성(문서화됨) + 5→6차 P3/P6 회귀 재현 3종 중 하나"},
@@ -67,8 +90,16 @@ CANARY_SET = [
      "note": "300블록, bay=4, w1=13,333 (prob_17/19와 같은 하위그룹)"},
     {"instance": "prob_19", "target": "P5",    "confidence": "medium-high",
      "note": "300블록, bay=4, w1=10,667 (prob_20은 w1=26,667/bay=5로 이질적이라 제외)"},
-    {"instance": "prob_40", "target": "P4",    "confidence": "low",
-     "note": "로컬 최혼잡 인스턴스 -- P4 '구조적 정체'가 혼잡도 관련이라는 최선 추측, 미확정"},
+    {"instance": "prob_40", "target": "P4",    "confidence": "medium",
+     "note": "로컬 최혼잡 인스턴스 + prob_36과 완전 동일한 가중치/규모 클러스터 "
+             "(w1=667, w2=1, w3=13, 250블록/4bay) -- 원래 단독 low-confidence 추측이었으나 "
+             "짝이 생겨 medium으로 상향"},
+    {"instance": "prob_36", "target": "P4",    "confidence": "medium",
+     "note": "prob_40과 완전 동일 가중치/규모 클러스터 (w1=667, w2=1, w3=13, 250블록/4bay) "
+             "-- 로컬 40개 중 w1=667은 prob_25/36/40 셋뿐인 희귀 구간"},
+    {"instance": "prob_20", "target": "미분류", "confidence": "low",
+     "note": "로컬 40개 중 유일한 5-bay 인스턴스 (나머지는 전부 2~4bay) -- P-타겟 추측이 아니라 "
+             "구조적 다양성 확보용. 병렬 워커수 실험에서 미대표 구조 커버 목적으로 추가"},
 ]
 
 

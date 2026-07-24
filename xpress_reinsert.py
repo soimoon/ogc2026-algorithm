@@ -742,6 +742,18 @@ def reinsert(remove_ids: list[int],
         # looks like a solver failure rather than a caller type mismatch).
         prob.controls.maxtime = int(remaining)
         prob.controls.outputlog = 0
+        # 2026-07-24 (user-caught, parallel-restart design review): without
+        # this, Xpress defaults to using as many threads as it detects
+        # cores, per solve. That is harmless when this module runs inside a
+        # single process, but myalgorithm._iterated_greedy_parallel now runs
+        # up to 4 of these processes concurrently -- each independently
+        # defaulting to multi-threaded Xpress would oversubscribe the
+        # competition's <=4 CPU core cap (up to 4 processes x 4 threads
+        # each). These candidate batches are tiny (K<=~170 even for
+        # wholebay) and solve in well under a second even single-threaded
+        # (see this function's own TIMING log line), so there is no
+        # meaningful solve-quality cost to pinning this.
+        prob.controls.threads = 1
         _t_solve0 = time.time()
         prob.solve()
         _t_solve1 = time.time()
