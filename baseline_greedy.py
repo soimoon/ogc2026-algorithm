@@ -3240,6 +3240,175 @@ def _try_rebalance_move(
     return result
 
 
+# -----------------------------------------------------------------------------
+# _try_reorder_move -- time-axis "topological order" ALNS operator
+# -----------------------------------------------------------------------------
+#
+# 2026-07-24 (user-proposed, scoped down after code-review discussion -- see
+# notes/algorithm_overview.md). Original idea: search over a TOPOLOGICAL
+# representation (relative order/position, e.g. Sequence-Pair or Slicing
+# Tree from VLSI floorplanning) instead of absolute (x, y, entry, exit)
+# tuples, decoded into concrete coordinates/times via a fast exact
+# algorithm (LP / longest-path). Rejected in that general form: those
+# techniques assume axis-aligned RECTANGLES with a static, purely SPATIAL
+# objective (minimize bounding box) -- neither holds here (irregular
+# multi-layer polygons, time-varying occupancy, the crane j>=k sweep rule
+# has no floorplanning analogue), and this codebase already measured that
+# SPACE isn't this problem's bottleneck (analysis/bay_utilization.py:
+# 33-53% peak occupancy) -- a technique built for dense spatial packing
+# would spend a lot of engineering effort on the wrong axis.
+#
+# What survived the scope-down: search over a RELATIVE ORDER, decoded
+# deterministically -- applied to the TIME axis only (release/due-date
+# scheduling is this problem's actual measured difficulty), and decoded via
+# the SAME _find_earliest_slot machinery every other operator in this
+# module already trusts, not new geometry/scheduling theory. Positions are
+# never touched by this operator -- only which order a fixed same-bay
+# window of blocks gets (re-)scheduled in.
+_REORDER_MAX_ORDERS_TRIED = 8
+_REORDER_MAX_SWAP_ROUNDS = 5
+
+
+def _try_reorder_move(
+    remove_ids: list[int],
+    blocks_data: list[dict],
+    bays: list[Bay],
+    bay_placed: list[list[Block]],
+    bay_schedule: list[list[tuple[int, int]]],
+    current_positions: dict[int, tuple],
+    orig_tardiness_sum: float,
+    deadline: float | None,
+    rng: "random.Random",
+) -> dict[int, dict] | None:
+    """
+    Keeps every block in remove_ids at its CURRENT (bay, x, y, orient_idx)
+    -- current_positions[bid] = (bay_id, x, y, orient_idx) -- and searches
+    only over their relative ENTRY ORDER, decoding each candidate order via
+    the same _find_earliest_slot search _place_blocks/_try_rebalance_move
+    already use. Targets the case where a block with lower actual urgency
+    happened to grab a contested slot ahead of a tighter-due-date block
+    that then went tardy -- fixable by trying the other order, with no
+    spatial change at all.
+
+    remove_ids must all share one bay_id -- the caller (see
+    _select_removal_candidates' "reorder" mode) only ever selects a
+    same-bay window, since blocks in different bays never interact and a
+    cross-bay "order" is meaningless. remove_ids is also assumed to already
+    be sorted by current entry_time (also guaranteed by that same caller)
+    -- used directly as the first candidate order to try.
+
+    Safety argument (why this can never do worse than leaving remove_ids
+    exactly where they were): bay_placed/bay_schedule reflect every OTHER
+    currently-placed block, i.e. exactly the context these blocks' CURRENT
+    entry/exit times were themselves already proven feasible against.
+    Decoding the current order back through _find_earliest_slot re-derives
+    a fact already known to hold, so it can only match or beat the current
+    tardiness sum. This is checked at runtime, not just trusted (2026-07-24
+    code review): if the current-order decode is infeasible, or its
+    tardiness sum exceeds orig_tardiness_sum (the caller-supplied sum from
+    before these blocks were removed), some assumption this function
+    depends on does not actually hold right now -- abort immediately
+    (return None) instead of trusting a result built on a broken premise.
+
+    Only AABB-overlapping pairs are ever tried as a swap: two
+    spatially-independent blocks' relative order is a proven no-op for
+    both (_find_earliest_slot's own AABB pre-filter means neither's decode
+    depends on the other being present at all), so swapping them can never
+    change either's outcome -- skipped without spending a
+    _find_earliest_slot call to (re)confirm that every time.
+
+    Returns None if the safety check on the current order fails, or if
+    remove_ids don't all share one bay_id. Otherwise returns a partial
+    assignment dict for the best-scoring order tried -- which may just be
+    the current order itself if no swap/shuffle improved on it, a valid
+    "no-op" proposal for the caller's normal accept/reject gate to evaluate
+    like any other operator's.
+    """
+    if len(remove_ids) < 2:
+        return None
+    bay_ids = {current_positions[bid][0] for bid in remove_ids}
+    if len(bay_ids) != 1:
+        return None
+    bay_id = next(iter(bay_ids))
+    bay = bays[bay_id]
+    base_placed = bay_placed[bay_id]
+    base_schedule = bay_schedule[bay_id]
+
+    def _decode(order: list[int]) -> tuple[dict[int, dict], float] | None:
+        trial_placed = list(base_placed)
+        trial_schedule = list(base_schedule)
+        out: dict[int, dict] = {}
+        total_tardiness = 0.0
+        for bid in order:
+            if deadline is not None and time.time() > deadline:
+                return None
+            _, cx, cy, oi = current_positions[bid]
+            blk_data = blocks_data[bid]
+            new_blk = Block(block_id=bid, block_data=blk_data, x=cx, y=cy, orient_idx=oi)
+            entry, exit_t = _find_earliest_slot(
+                new_blk, bay, trial_placed, trial_schedule,
+                blk_data["release_time"], blk_data["processing_time"], deadline=deadline,
+            )
+            if entry is None:
+                return None
+            trial_placed.append(new_blk)
+            trial_schedule.append((entry, exit_t))
+            total_tardiness += max(0.0, exit_t - blk_data["due_date"])
+            out[bid] = {
+                "block_id": bid, "bay_id": bay_id,
+                "x": int(cx), "y": int(cy), "orient_idx": oi,
+                "entry_time": int(entry), "exit_time": int(exit_t),
+            }
+        return out, total_tardiness
+
+    current_order = list(remove_ids)
+    base = _decode(current_order)
+    if base is None or base[1] > orig_tardiness_sum + 1e-6:
+        return None  # safety check failed -- see docstring
+    best_result, best_score = base
+
+    world_bboxes: dict[int, tuple[float, float, float, float]] = {}
+    for bid in remove_ids:
+        _, cx, cy, oi = current_positions[bid]
+        lx0, ly0, lx1, ly1 = _block_bbox(blocks_data[bid], oi)
+        world_bboxes[bid] = (cx + lx0, cy + ly0, cx + lx1, cy + ly1)
+
+    n_tried = 1
+    order = list(current_order)
+    for _round in range(_REORDER_MAX_SWAP_ROUNDS):
+        if n_tried >= _REORDER_MAX_ORDERS_TRIED or (deadline is not None and time.time() > deadline):
+            break
+        improved = False
+        for i in range(len(order) - 1):
+            a, b = order[i], order[i + 1]
+            if not _bb_overlap(world_bboxes[a], world_bboxes[b]):
+                continue  # provably a no-op -- see docstring
+            if n_tried >= _REORDER_MAX_ORDERS_TRIED:
+                break
+            trial_order = list(order)
+            trial_order[i], trial_order[i + 1] = trial_order[i + 1], trial_order[i]
+            n_tried += 1
+            trial = _decode(trial_order)
+            if trial is not None and trial[1] < best_score - 1e-6:
+                best_result, best_score = trial
+                order = trial_order
+                improved = True
+        if not improved:
+            break
+
+    for _ in range(2):
+        if n_tried >= _REORDER_MAX_ORDERS_TRIED or (deadline is not None and time.time() > deadline):
+            break
+        shuffled = list(remove_ids)
+        rng.shuffle(shuffled)
+        n_tried += 1
+        trial = _decode(shuffled)
+        if trial is not None and trial[1] < best_score - 1e-6:
+            best_result, best_score = trial
+
+    return best_result
+
+
 def _select_removal_candidates(
     best_assignments: dict[int, dict],
     blocks_data: list[dict],
@@ -3359,6 +3528,41 @@ def _select_removal_candidates(
         ]
         scored.sort(key=lambda t: -t[1])
         return [bid for bid, _ in scored[:k]]
+
+    if mode == "reorder":
+        # 2026-07-24 (user-proposed) -- see _try_reorder_move's own
+        # docstring for the operator itself. Picks a contiguous WINDOW of
+        # same-bay blocks, sorted by current entry_time, centred on the
+        # current worst-tardiness block: only TEMPORALLY ADJACENT blocks in
+        # the same bay can possibly interact via a reordering (blocks far
+        # apart in time share no relevant _find_earliest_slot context), so
+        # a window around the worst offender is where a reordering is most
+        # likely to find something. Needs >=2 blocks to have an "order" to
+        # perturb at all.
+        if k < 2:
+            return []
+        tardy_scored = [
+            (bid, a["exit_time"] - blocks_data[bid]["due_date"])
+            for bid, a in best_assignments.items()
+            if a["exit_time"] - blocks_data[bid]["due_date"] > 0
+        ]
+        if not tardy_scored:
+            return []
+        tardy_scored.sort(key=lambda t: -t[1])
+        worst_bid = tardy_scored[0][0]
+        target_bay = best_assignments[worst_bid]["bay_id"]
+        same_bay = sorted(
+            (bid for bid, a in best_assignments.items() if a["bay_id"] == target_bay),
+            key=lambda bid: best_assignments[bid]["entry_time"],
+        )
+        if len(same_bay) < 2:
+            return []
+        idx = same_bay.index(worst_bid)
+        half = k // 2
+        lo = max(0, idx - half)
+        hi = min(len(same_bay), lo + k)
+        lo = max(0, hi - k)  # re-clamp so a window near either edge still gets up to k blocks
+        return same_bay[lo:hi]
 
     if mode == "wholebay":
         # Whole-bay joint reinsertion (added 2026-07-21): unlike every other
@@ -3982,8 +4186,17 @@ def _improve(prob_info: dict,
     # K round), so over-boosting its roulette-wheel odds while Z1 has
     # headroom risks spending disproportionate time on it; its natural EMA
     # weight already lets it earn more rounds if it keeps paying off.
-    operator_names = (["tardy", "swap", "wholebay", "preference", "balance", "random"]
-                      if z2z3_modes else ["tardy", "swap", "wholebay"])
+    # 2026-07-24 ("reorder", user-proposed): grouped with tardy/swap (same
+    # Z1-lower-bound zero-weighting/urgency-boost treatment below) since it
+    # exists purely to reduce Z1 by trying a different relative ENTRY ORDER
+    # for a same-bay window of blocks, at their CURRENT positions -- see
+    # _try_reorder_move's docstring for the full design rationale and why
+    # this is scoped to the time axis only (not a general spatial topology
+    # search, which was considered and rejected as a poor fit for this
+    # problem's irregular-polygon/crane-sweep/time-varying-occupancy
+    # structure).
+    operator_names = (["tardy", "swap", "reorder", "wholebay", "preference", "balance", "random"]
+                      if z2z3_modes else ["tardy", "swap", "reorder", "wholebay"])
     op_weight: dict[str, float] = {name: 1.0 for name in operator_names}
     Z1_URGENCY_BOOST = 3.0  # see the round-selection weights computation below
 
@@ -4145,11 +4358,11 @@ def _improve(prob_info: dict,
         # (e.g. a Z2/Z3 trade-off that regresses Z1 slightly).
         z1_at_bound = best_obj1 <= z1_lower_bound + 1e-6
         active_operator_names = [
-            n for n in operator_names if not (z1_at_bound and n in ("tardy", "swap"))
+            n for n in operator_names if not (z1_at_bound and n in ("tardy", "swap", "reorder"))
         ]
         weights = [
-            0.0 if (z1_at_bound and n in ("tardy", "swap"))
-            else op_weight[n] * (Z1_URGENCY_BOOST if n in ("tardy", "swap") else 1.0)
+            0.0 if (z1_at_bound and n in ("tardy", "swap", "reorder"))
+            else op_weight[n] * (Z1_URGENCY_BOOST if n in ("tardy", "swap", "reorder") else 1.0)
             for n in operator_names
         ]
         mode = rng.choices(operator_names, weights=weights, k=1)[0]
@@ -4286,6 +4499,26 @@ def _improve(prob_info: dict,
             partial = _try_rebalance_move(
                 remove_ids, target_bay_id, blocks_data, bays,
                 bay_placed, bay_schedule, deadline,
+            )
+            used_direct = partial is not None
+        elif mode == "reorder":
+            # current_assignments (not trial_assignments -- remove_ids were
+            # already popped from that above) still has remove_ids' current
+            # (bay, x, y, orient) and the tardiness they had before removal,
+            # both needed by _try_reorder_move's own safety check (see its
+            # docstring).
+            reorder_positions = {
+                bid: (current_assignments[bid]["bay_id"], current_assignments[bid]["x"],
+                     current_assignments[bid]["y"], current_assignments[bid]["orient_idx"])
+                for bid in remove_ids
+            }
+            reorder_orig_tardiness = sum(
+                max(0.0, current_assignments[bid]["exit_time"] - blocks_data[bid]["due_date"])
+                for bid in remove_ids
+            )
+            partial = _try_reorder_move(
+                remove_ids, blocks_data, bays, bay_placed, bay_schedule,
+                reorder_positions, reorder_orig_tardiness, deadline, rng,
             )
             used_direct = partial is not None
 
