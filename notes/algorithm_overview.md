@@ -577,6 +577,32 @@
     **9차 패키징**: 위 수정 포함 최종 코드로 `submissions/submission_20260724_1332.zip` 생성(3개 파일,
     utils.py/cpsat_reinsert.py 미포함, 절대경로 없음 확인).
 
+81. **`_find_earliest_slot`의 Stage-4+ pre-check 완결성 gap 발견/실측/수정 (2026-07-24, `#78`과 별개의
+    독립 코드 리뷰 세션)**
+    **배경**: `#78`과 마찬가지로 문서 대조 없이 `myalgorithm.py`/`baseline_greedy.py`/`xpress_reinsert.py`
+    핵심 경로(캐싱 로직, deadline 체크, safety-net)를 처음부터 다시 라인 단위로 읽고 대조하는 리뷰 요청.
+    `_find_earliest_slot`의 Stage-4+ 사전체크(946~967번 줄, `#20`에서 도입)를 수학적으로 전수 분석한
+    결과, 시간구간이 겹치는 b_other에 대해 세 분기(진입이 창 안, 퇴출이 창 안, 완전 nested) 중 정확히
+    한 조합만 빠짐을 증명: **`a_other == entry`(정확히 같은 시각 진입, `entry < a_other` 엄격부등호에서
+    제외)이면서 `e_other > exit_t`(new_blk보다 오래 머묾, nested 조건의 `e_other <= exit_t`도 실패)인
+    경우**. `check_feasibility`의 Stage 2/3는 동시진입을 Stage 5(순서)로 미루고 제외하지만, **Stage 4는
+    이 예외가 없어** 실제 충돌이면 나중에 Repair 단계에서 잡힘 -- 즉 feasibility 버그가 아니라 construction
+    단계의 완결성 gap(불필요한 repair round 소모 가능성)으로 판단.
+    **실측 (고치기 전에 먼저, [[feedback_empirical_verification]])**: `analysis/measure_stage4_gap.py`
+    신설(리포 파일은 안 건드리고 `_find_earliest_slot`을 동일 로직 + 진단 카운터만 추가한 버전으로
+    monkeypatch) -- 로컬 40개 인스턴스(train 20 + train-set2 20) 20초씩 전수 실행. 이 조합 자체는
+    1,529,727회 호출 중 4,672회(~0.3%) 노출됐지만, `check_collisions`가 실제 충돌을 찾은 경우는
+    **0/4,672 (0%)**. 구조적 이유: `candidate_entries`가 항상 `{r_time} ∪ {다른 블록들의 exit_time}`
+    에서만 뽑히고 다른 블록의 *entry_time*에서는 절대 안 뽑히므로, `a_other==entry`가 성립하려면 b_other의
+    entry_time이 우연히 새 블록의 후보 entry와 일치해야 하고, 그 경우는 대부분 bay가 거의 빈 초반이라
+    공간적으로도 안 겹칠 가능성이 높음 -- 로컬 인스턴스 규모/혼잡도에서는 사실상 무해.
+    **수정**: 그래도 비용이 사실상 0(기존 nested 분기와 완전히 같은 `check_collisions` 패턴, 이미 드문
+    조합에서만 진입)이라 gap 자체는 닫음 -- 기존 3개 분기 바로 뒤에 `a_other == entry and e_other >
+    exit_t` 4번째 분기 추가, 걸리면 기존과 동일하게 `s4_blocked=True` + `idx += 1`(별도 점프 타겟 없음,
+    기존 nested 분기와 동일 사유).
+    **검증**: 로컬 40개 로버스트니스(20초 예산) 재실행으로 회귀/크래시 없음 확인 -- 자세한 수치는
+    `notes/experiments.md` 해당 날짜 항목 참조.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들
