@@ -695,6 +695,37 @@ def _tiered_phase3_worker(pre_state: dict, seed: int) -> tuple:
         return (seed, None, None)
 
 
+def _assignments_from_solution(solution: dict) -> dict[int, dict]:
+    """
+    Reverse of baseline_greedy._build_operations -- reconstructs a flat
+    assignments dict (block_id -> {block_id, bay_id, x, y, orient_idx,
+    entry_time, exit_time}) from a wrapped {"operations": {time_str: [op,
+    ...]}} solution.
+
+    Needed for island-model migration only: each round's winning candidate
+    is tracked as a solution dict (matching this module's own final return
+    contract, and reusing _tiered_phase3_worker's existing tested return
+    shape unchanged), but the NEXT round's pre_state["assignments"] needs
+    the raw per-block dict baseline_greedy._improve() itself operates on --
+    converting once per round is cheap (single pass over the operations
+    dict) compared to the Phase-3 search it feeds into.
+    """
+    out: dict[int, dict] = {}
+    for t_str, ops in solution["operations"].items():
+        t = int(t_str)
+        for op in ops:
+            bid = op["block_id"]
+            entry = out.setdefault(bid, {"block_id": bid, "bay_id": op["bay_id"]})
+            if op["type"] == "ENTRY":
+                entry["x"] = op["x"]
+                entry["y"] = op["y"]
+                entry["orient_idx"] = op["orient_idx"]
+                entry["entry_time"] = t
+            else:
+                entry["exit_time"] = t
+    return out
+
+
 def _tiered_phase3_entry(result_queue, pre_state: dict, seed: int) -> None:
     """Module-level (picklable) process entry point -- see
     _parallel_attempt_entry, same wrapping rationale."""
@@ -706,6 +737,158 @@ def _tiered_phase3_entry(result_queue, pre_state: dict, seed: int) -> None:
         result_queue.put(result)
     except Exception:
         pass
+
+
+# 2026-07-24 (island-model migration, user-proposed "try idea #2"): every
+# Phase-3 chain up to this point ran to completion with zero communication
+# between workers -- a worker that drew an unlucky sequence of ALNS moves
+# (or just started from a weaker basin, in the N-independent-pipeline
+# fallback) had no way to benefit from another worker's progress until the
+# very end, when only the single best result gets kept and everything else
+# is thrown away. Splitting each worker's budget into _ISLAND_N_SEGMENTS
+# rounds and having every worker's NEXT round start from the GLOBAL best
+# found so far (not its own -- full migration, not partial) reallocates
+# the whole parallel budget toward whatever the swarm's best basin turns
+# out to be, each round, instead of some cores potentially spending their
+# entire budget on a basin nothing ever rescues them from.
+#
+# Deliberately reuses the exact SAME dispatch/collect/cleanup machinery as
+# the original single-shot design (_tiered_phase3_round below is the same
+# logic _iterated_greedy_tiered used to run once, inline, now callable
+# multiple times) rather than inventing live inter-process communication
+# (a shared Manager/pipe mid-run) -- each "round" is its own independent
+# spawn-collect-cleanup cycle, exactly like today's proven single round,
+# just repeated with an evolving starting point. This trades some
+# additional process-spawn overhead (paid _ISLAND_N_SEGMENTS times instead
+# of once) for migration -- only engaged when there is enough total budget
+# to make that trade worthwhile (see _ISLAND_MIN_SEGMENT_BUDGET below);
+# below that, degrades to exactly one round covering the whole remaining
+# budget, identical to the pre-migration behaviour.
+#
+# Provably no worse than the non-segmented version: the global best is
+# tracked via a plain min() across every candidate from every round (same
+# pattern as the original single-round collection), so it can only ever
+# stay the same or improve round over round -- a "wasted" round (every
+# worker's segment fails to beat the incoming global best) just means the
+# next round starts from the same place, not a regression.
+_ISLAND_N_SEGMENTS = 3
+# Below this per-segment budget, process-spawn overhead (paid once per
+# segment, not once total) starts to dominate -- see
+# _PARALLEL_SPAWN_OVERHEAD_BUFFER's own docstring for the same tradeoff at
+# the single-round level. Segmenting is only attempted when
+# remaining_after_construct / _ISLAND_N_SEGMENTS would stay at or above
+# this floor; otherwise _iterated_greedy_tiered runs exactly one
+# unsegmented round instead, identical to before this feature existed.
+_ISLAND_MIN_SEGMENT_BUDGET = 10.0
+
+
+def _tiered_phase3_round(pre_state: dict, n_workers: int, deadline: float,
+                         seed_base: int) -> list[tuple[int, dict, float]]:
+    """
+    Runs ONE round of Phase-3 exploration: the main process's own chain
+    (seed=seed_base) plus n_workers additional spawned processes (seeds
+    seed_base+1..seed_base+n_workers), all starting from pre_state's
+    CURRENT assignments/known_result/timelimit, for whatever time remains
+    until `deadline`. Returns every candidate collected this round as
+    (seed, solution, objective) tuples -- may be shorter than n_workers+1
+    if some worker failed, timed out, or never reported back; may even be
+    empty if the main chain itself raised AND every spawned worker failed
+    (caller must handle an empty list, e.g. by falling back to pre_state's
+    own known_result as a still-valid floor).
+
+    Identical dispatch/collect/cleanup logic to the single-round design
+    this replaces (fork-preferred, proportional collect_grace, explicit
+    unconditional process cleanup in a finally block) -- see
+    _iterated_greedy_tiered's own module-level comment for why. Extracted
+    into its own function specifically so _iterated_greedy_tiered can call
+    it multiple times (island-model migration) without duplicating this
+    logic per round.
+
+    Never raises -- every internal failure mode (spawn failure, a worker
+    exception, IPC issues) degrades to "fewer candidates in the returned
+    list", matching every other "this path failed, treat it as routine"
+    contract in this module.
+    """
+    import time
+    import multiprocessing as mp
+
+    candidates: list[tuple[int, dict, float]] = []
+    remaining = deadline - time.time()
+    pre_state["timelimit"] = max(0.0, remaining)
+    pre_state["t_start"] = time.time()
+
+    try:
+        main_seed, main_sol, main_obj = _tiered_phase3_worker(pre_state, seed=seed_base)
+        if main_sol is not None:
+            candidates.append((main_seed, main_sol, main_obj))
+    except Exception as exc:
+        print(f"[algorithm] tiered round: main chain (seed={seed_base}) raised "
+              f"{type(exc).__name__}: {exc}")
+
+    if n_workers <= 0 or remaining < _PARALLEL_MIN_BUDGET:
+        return candidates
+
+    available = mp.get_all_start_methods()
+    start_method = "fork" if "fork" in available else "spawn"
+
+    procs = []
+    result_queue = None
+    try:
+        ctx = mp.get_context(start_method)
+        result_queue = ctx.Queue()
+        for i in range(n_workers):
+            worker_seed = seed_base + 1 + i
+            p = ctx.Process(
+                target=_tiered_phase3_entry,
+                args=(result_queue, pre_state, worker_seed),
+                daemon=True,
+            )
+            p.start()
+            procs.append(p)
+    except Exception as exc:
+        print(f"[algorithm] tiered round: worker spawn failed ({type(exc).__name__}: {exc})")
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        return candidates
+
+    collect_grace = min(_PARALLEL_COLLECT_GRACE, remaining * 0.1)
+    collect_deadline = deadline + collect_grace
+    n_collected = 0
+    try:
+        while n_collected < len(procs):
+            remaining_wait = collect_deadline - time.time()
+            if remaining_wait <= 0:
+                print(f"[algorithm] tiered round: collection deadline hit with "
+                      f"{len(procs) - n_collected} worker(s) still outstanding")
+                break
+            try:
+                w_seed, w_sol, w_obj = result_queue.get(timeout=remaining_wait)
+            except Exception:
+                print(f"[algorithm] tiered round: collection timed out with "
+                      f"{len(procs) - n_collected} worker(s) still outstanding")
+                break
+            n_collected += 1
+            if w_sol is None:
+                print(f"[algorithm] tiered round: worker (seed={w_seed}) infeasible/failed -- discarded")
+                continue
+            candidates.append((w_seed, w_sol, w_obj))
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=2.0)
+        if result_queue is not None:
+            try:
+                result_queue.close()
+                result_queue.join_thread()
+            except Exception:
+                pass
+
+    return candidates
 
 
 def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadline: float):
@@ -781,120 +964,85 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
 
     base_sol = {"operations": baseline_greedy._build_operations(
         list(pre_state["assignments"].values()))}
-    candidates: list[tuple[int, dict, float]] = [(0, base_sol, base_result["objective"])]
+    global_best_seed: int = 0
+    global_best_sol: dict = base_sol
+    global_best_obj: float = base_result["objective"]
+    n_attempts_total = 1  # the shared base itself always counts as one
 
     remaining_after_construct = deadline - time.time()
-    # 2026-07-24 (safety review, user-prompted -- "does a slow server risk
-    # quality WORSE than plain single-threaded?"): ALWAYS attempt one local
-    # (in-process, no spawn overhead) Phase 3 chain with WHATEVER time is
-    # left, however little -- this is exactly what plain sequential
-    # greedyalgorithm() already guarantees (Phase 3 still gets its
-    # increasingly small tail even when Repair eats up to 95% of the
-    # budget), so tiered must guarantee at least the same, never less. An
-    # earlier version of this function short-circuited straight to
-    # "return the base as-is" whenever remaining_after_construct dropped
-    # below _PARALLEL_MIN_BUDGET (a threshold picked for a completely
-    # different question -- "is it worth PROCESS-SPAWN overhead" -- not
-    # "is it worth trying at all") -- on a slow server / hard instance
-    # where shared construction unexpectedly eats nearly the whole budget,
-    # that produced a real, narrow regression: zero Phase-3 attempts where
-    # plain sequential execution would still have gotten a few. Only the
-    # DECISION to spawn ADDITIONAL worker processes (real overhead, only
-    # worth paying above the threshold) stays gated on _PARALLEL_MIN_BUDGET
-    # -- see below.
-    pre_state["timelimit"] = max(0.0, remaining_after_construct)
-    pre_state["t_start"] = time.time()
-    try:
-        main_seed, main_sol, main_obj = _tiered_phase3_worker(pre_state, seed=0)
-        if main_sol is not None:
-            candidates.append((main_seed, main_sol, main_obj))
-    except Exception as exc:
-        print(f"[algorithm] tiered: main Phase-3 chain raised {type(exc).__name__}: {exc}")
+    n_workers = n_slots - 1  # additional spawned workers beyond the main process's own chain each round
 
-    if remaining_after_construct < _PARALLEL_MIN_BUDGET:
-        best_seed, best_solution, best_objective = min(candidates, key=lambda c: c[2])
-        print(f"[algorithm] tiered: only {remaining_after_construct:.1f}s left after shared "
-              f"construction -- skipped spawning additional workers (still ran one local "
-              f"Phase-3 chain), best from seed={best_seed} objective={best_objective:.0f}")
-        return best_solution, best_objective, len(candidates)
-
-    n_workers = n_slots - 1  # main process already ran its own Phase-3 chain above
+    # Island-model migration (see the module-level comment above
+    # _tiered_phase3_round) only when there's enough total budget that
+    # EVERY segment would still clear _ISLAND_MIN_SEGMENT_BUDGET --
+    # otherwise n_segments=1 runs exactly one round covering the whole
+    # remaining budget, byte-for-byte the same as this feature's
+    # pre-migration behaviour (including the "always try the local chain
+    # even with almost no time left" safety property, since a single round
+    # with n_workers possibly still >0 but remaining < _PARALLEL_MIN_BUDGET
+    # already degrades to local-chain-only inside _tiered_phase3_round).
+    if n_workers > 0 and remaining_after_construct / _ISLAND_N_SEGMENTS >= _ISLAND_MIN_SEGMENT_BUDGET:
+        n_segments = _ISLAND_N_SEGMENTS
+    else:
+        n_segments = 1
 
     available = mp.get_all_start_methods()
     start_method = "fork" if "fork" in available else "spawn"
+    print(f"[algorithm] tiered: shared EDD construction done "
+          f"({remaining - remaining_after_construct:.1f}s), {n_workers} additional worker(s) "
+          f"per round x {n_segments} round(s) (start_method={start_method}, "
+          f"{n_cores} core(s) detected), {remaining_after_construct:.1f}s total Phase-3 budget")
 
-    procs = []
-    result_queue = None
-    try:
-        ctx = mp.get_context(start_method)
-        result_queue = ctx.Queue()
-        for i in range(n_workers):
-            worker_seed = 1000 + i  # distinct from the main process's own seed=0 chain above
-            p = ctx.Process(
-                target=_tiered_phase3_entry,
-                args=(result_queue, pre_state, worker_seed),
-                daemon=True,
-            )
-            p.start()
-            procs.append(p)
-    except Exception as exc:
-        print(f"[algorithm] tiered: Phase-3 worker spawn failed ({type(exc).__name__}: "
-              f"{exc}) -- using the best local candidate so far")
-        for p in procs:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-        best_seed, best_solution, best_objective = min(candidates, key=lambda c: c[2])
-        return best_solution, best_objective, len(candidates)
+    for segment_idx in range(n_segments):
+        segment_now = time.time()
+        if segment_now >= deadline:
+            break
+        # Split whatever's ACTUALLY left (not a pre-computed fixed share)
+        # evenly across the REMAINING segments -- self-correcting if an
+        # earlier segment ran short or long, same spirit as
+        # _PARALLEL_SPAWN_OVERHEAD_BUFFER's "measure, don't assume" pattern.
+        segments_left = n_segments - segment_idx
+        segment_deadline = deadline if segments_left <= 1 else \
+            segment_now + (deadline - segment_now) / segments_left
 
-    print(f"[algorithm] tiered: shared EDD construction done ({remaining - remaining_after_construct:.1f}s), "
-          f"{len(procs)} additional Phase-3 worker(s) dispatched (start_method={start_method}, "
-          f"{n_cores} core(s) detected), timelimit={remaining_after_construct:.1f}s each")
+        # Migrate: every round starts from the GLOBAL best found so far
+        # (full migration, not each worker's own previous result), so a
+        # worker that drew an unlucky ALNS sequence last round gets a fresh
+        # shot from the swarm's actual best instead of continuing to dig
+        # wherever it ended up. pre_state is this function's own local
+        # dict (built once from greedyalgorithm's return_pre_improve_state,
+        # never shared with any other caller) -- mutating its
+        # assignments/known_result between rounds is exactly the mechanism
+        # that propagates migration into the next round's dispatch.
+        if segment_idx > 0:
+            pre_state["assignments"] = _assignments_from_solution(global_best_sol)
+            # known_result=None (not a fabricated dict) is deliberate --
+            # _improve() needs feasible/objective/obj1 (for its own
+            # z1_lower_bound gating) and possibly more later; None makes it
+            # recompute check_feasibility fresh internally (its own
+            # documented fallback for "unknown starting state"), which is
+            # the same cost check_feasibility_incremental's own shadow-
+            # validated contract already accepts elsewhere in this
+            # codebase -- correct and safe, just not free, unlike trying to
+            # hand-construct a partial result dict that could KeyError or
+            # silently carry a stale/wrong obj1.
+            pre_state["known_result"] = None
 
-    collect_grace = min(_PARALLEL_COLLECT_GRACE, remaining_after_construct * 0.1)
-    collect_deadline = deadline + collect_grace
-    n_collected = 0
-    try:
-        while n_collected < len(procs):
-            remaining_wait = collect_deadline - time.time()
-            if remaining_wait <= 0:
-                print(f"[algorithm] tiered: collection deadline hit with "
-                      f"{len(procs) - n_collected} Phase-3 worker(s) still outstanding")
-                break
-            try:
-                w_seed, w_sol, w_obj = result_queue.get(timeout=remaining_wait)
-            except Exception:
-                print(f"[algorithm] tiered: collection timed out with "
-                      f"{len(procs) - n_collected} Phase-3 worker(s) still outstanding")
-                break
-            n_collected += 1
-            if w_sol is None:
-                print(f"[algorithm] tiered Phase-3 worker (seed={w_seed}): "
-                      f"infeasible or failed -- discarded")
-                continue
-            candidates.append((w_seed, w_sol, w_obj))
-    finally:
-        for p in procs:
-            if p.is_alive():
-                p.terminate()
-        for p in procs:
-            p.join(timeout=2.0)
-        if result_queue is not None:
-            try:
-                result_queue.close()
-                result_queue.join_thread()
-            except Exception:
-                pass
+        round_candidates = _tiered_phase3_round(
+            pre_state, n_workers, segment_deadline, seed_base=1000 * segment_idx,
+        )
+        n_attempts_total += len(round_candidates)
+        for cand_seed, cand_sol, cand_obj in round_candidates:
+            if cand_obj < global_best_obj - 1e-6:
+                global_best_seed, global_best_sol, global_best_obj = cand_seed, cand_sol, cand_obj
+        print(f"[algorithm] tiered: round {segment_idx + 1}/{n_segments} collected "
+              f"{len(round_candidates)} candidate(s), global best so far: "
+              f"seed={global_best_seed} objective={global_best_obj:.0f}")
 
-    best_seed, best_solution, best_objective = candidates[0]
-    for cand_seed, cand_sol, cand_obj in candidates[1:]:
-        if cand_obj < best_objective - 1e-6:
-            best_seed, best_solution, best_objective = cand_seed, cand_sol, cand_obj
-    print(f"[algorithm] tiered: {len(candidates)} Phase-3 chain(s) collected (including the "
-          f"shared base itself), best from seed={best_seed} objective={best_objective:.0f}")
+    print(f"[algorithm] tiered: {n_attempts_total} Phase-3 attempt(s) total across "
+          f"{n_segments} round(s), best from seed={global_best_seed} objective={global_best_obj:.0f}")
 
-    return best_solution, best_objective, len(candidates)
+    return global_best_sol, global_best_obj, n_attempts_total
 
 
 def _emergency_fallback(prob_info: dict) -> dict:
