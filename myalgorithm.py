@@ -781,27 +781,46 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
               f"-- falling back to N-independent-pipeline parallel restart")
         return _fallback()
 
+    base_sol = {"operations": baseline_greedy._build_operations(
+        list(pre_state["assignments"].values()))}
+    candidates: list[tuple[int, dict, float]] = [(0, base_sol, base_result["objective"])]
+
     remaining_after_construct = deadline - time.time()
-    if remaining_after_construct < _PARALLEL_MIN_BUDGET:
-        # Construction alone used (almost) the whole budget -- nothing left
-        # to usefully fan out. The base itself is still a fully verified
-        # feasible result (base_result), so return it as-is rather than
-        # spending any of the little time left on process-spawn overhead
-        # for a Phase 3 pass that would barely run anyway.
-        print(f"[algorithm] tiered: only {remaining_after_construct:.1f}s left after shared "
-              f"construction -- returning the base as-is (no Phase-3 fan-out)")
-        sol = {"operations": baseline_greedy._build_operations(
-            list(pre_state["assignments"].values()))}
-        return sol, base_result["objective"], 1
-
-    # Each Phase-3 worker's own budget/clock -- t_start reset to now (not
-    # the shared construction's own t_start) so _improve's internal
-    # timelimit-relative deadline math is correct for THIS remaining window,
-    # not double-counting the time construction already spent.
-    pre_state["timelimit"] = remaining_after_construct
+    # 2026-07-24 (safety review, user-prompted -- "does a slow server risk
+    # quality WORSE than plain single-threaded?"): ALWAYS attempt one local
+    # (in-process, no spawn overhead) Phase 3 chain with WHATEVER time is
+    # left, however little -- this is exactly what plain sequential
+    # greedyalgorithm() already guarantees (Phase 3 still gets its
+    # increasingly small tail even when Repair eats up to 95% of the
+    # budget), so tiered must guarantee at least the same, never less. An
+    # earlier version of this function short-circuited straight to
+    # "return the base as-is" whenever remaining_after_construct dropped
+    # below _PARALLEL_MIN_BUDGET (a threshold picked for a completely
+    # different question -- "is it worth PROCESS-SPAWN overhead" -- not
+    # "is it worth trying at all") -- on a slow server / hard instance
+    # where shared construction unexpectedly eats nearly the whole budget,
+    # that produced a real, narrow regression: zero Phase-3 attempts where
+    # plain sequential execution would still have gotten a few. Only the
+    # DECISION to spawn ADDITIONAL worker processes (real overhead, only
+    # worth paying above the threshold) stays gated on _PARALLEL_MIN_BUDGET
+    # -- see below.
+    pre_state["timelimit"] = max(0.0, remaining_after_construct)
     pre_state["t_start"] = time.time()
+    try:
+        main_seed, main_sol, main_obj = _tiered_phase3_worker(pre_state, seed=0)
+        if main_sol is not None:
+            candidates.append((main_seed, main_sol, main_obj))
+    except Exception as exc:
+        print(f"[algorithm] tiered: main Phase-3 chain raised {type(exc).__name__}: {exc}")
 
-    n_workers = n_slots - 1  # main process runs its own Phase-3 chain too
+    if remaining_after_construct < _PARALLEL_MIN_BUDGET:
+        best_seed, best_solution, best_objective = min(candidates, key=lambda c: c[2])
+        print(f"[algorithm] tiered: only {remaining_after_construct:.1f}s left after shared "
+              f"construction -- skipped spawning additional workers (still ran one local "
+              f"Phase-3 chain), best from seed={best_seed} objective={best_objective:.0f}")
+        return best_solution, best_objective, len(candidates)
+
+    n_workers = n_slots - 1  # main process already ran its own Phase-3 chain above
 
     available = mp.get_all_start_methods()
     start_method = "fork" if "fork" in available else "spawn"
@@ -812,7 +831,7 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
         ctx = mp.get_context(start_method)
         result_queue = ctx.Queue()
         for i in range(n_workers):
-            worker_seed = 1000 + i  # distinct from the main process's own seed=0 chain below
+            worker_seed = 1000 + i  # distinct from the main process's own seed=0 chain above
             p = ctx.Process(
                 target=_tiered_phase3_entry,
                 args=(result_queue, pre_state, worker_seed),
@@ -822,30 +841,18 @@ def _iterated_greedy_tiered(prob_info, baseline_greedy, check_feasibility, deadl
             procs.append(p)
     except Exception as exc:
         print(f"[algorithm] tiered: Phase-3 worker spawn failed ({type(exc).__name__}: "
-              f"{exc}) -- using the shared base as-is")
+              f"{exc}) -- using the best local candidate so far")
         for p in procs:
             try:
                 p.terminate()
             except Exception:
                 pass
-        sol = {"operations": baseline_greedy._build_operations(
-            list(pre_state["assignments"].values()))}
-        return sol, base_result["objective"], 1
+        best_seed, best_solution, best_objective = min(candidates, key=lambda c: c[2])
+        return best_solution, best_objective, len(candidates)
 
     print(f"[algorithm] tiered: shared EDD construction done ({remaining - remaining_after_construct:.1f}s), "
-          f"{len(procs)} Phase-3 worker(s) + main dispatched (start_method={start_method}, "
+          f"{len(procs)} additional Phase-3 worker(s) dispatched (start_method={start_method}, "
           f"{n_cores} core(s) detected), timelimit={remaining_after_construct:.1f}s each")
-
-    # Main process runs its own Phase-3 chain concurrently (seed=0), using
-    # its own core instead of sitting idle.
-    candidates: list[tuple[int, dict, float]] = [(0, {"operations": baseline_greedy._build_operations(
-        list(pre_state["assignments"].values()))}, base_result["objective"])]
-    try:
-        w_seed, w_sol, w_obj = _tiered_phase3_worker(pre_state, seed=0)
-        if w_sol is not None:
-            candidates.append((w_seed, w_sol, w_obj))
-    except Exception as exc:
-        print(f"[algorithm] tiered: main Phase-3 chain raised {type(exc).__name__}: {exc}")
 
     collect_grace = min(_PARALLEL_COLLECT_GRACE, remaining_after_construct * 0.1)
     collect_deadline = deadline + collect_grace
