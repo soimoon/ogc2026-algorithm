@@ -41,11 +41,6 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import myalgorithm
-from utils import check_feasibility
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CANARY_HISTORY_PATH = Path(__file__).resolve().parent / "canary_history.jsonl"
 
@@ -125,11 +120,37 @@ def _print_history_table(history: list[dict]) -> None:
         for row in rows[-10:]:
             status = "FEASIBLE" if row["feasible"] else "INFEASIBLE"
             obj = f"{row['objective']:,.0f}" if row["objective"] is not None else "N/A"
-            print(f"  {row['timestamp']}  commit={row['commit']:<8}  timelimit={row['timelimit']:.0f}s  "
-                 f"{status}  obj={obj}  {row.get('label', '')}")
+            ver = row.get("code_version", "working-tree")
+            print(f"  {row['timestamp']}  code={ver:<28}  commit={row['commit']:<8}  "
+                 f"timelimit={row['timelimit']:.0f}s  {status}  obj={obj}  {row.get('label', '')}")
 
 
-def run(timelimit: float, label: str) -> None:
+def run(timelimit: float, label: str, code_dir: str | None, only: str | None = None) -> None:
+    # 2026-07-24 (user-proposed): optionally test an OLD code snapshot (e.g.
+    # submissions/submission_20260723_1250, the 7th round's actual submitted
+    # code) against the same canary set, for a local-only stand-in comparison
+    # while waiting for a round's real eval-server score to come back.
+    # Prepending code_dir to sys.path makes `import myalgorithm` (which
+    # itself does `import baseline_greedy` / `import xpress_reinsert`)
+    # resolve to THAT directory's copies instead of the repo root's current
+    # working-tree versions -- utils.py is deliberately NOT shipped in
+    # submission snapshots (it's server-provided/never modified), so it
+    # still resolves to the repo root's copy either way, exactly matching
+    # how the grading server actually runs old submissions.
+    if code_dir:
+        code_path = str(Path(code_dir).resolve())
+        sys.path.insert(0, code_path)
+        version_label = Path(code_dir).name
+    else:
+        sys.path.insert(0, str(REPO_ROOT))
+        version_label = "working-tree"
+    sys.path.insert(0, str(REPO_ROOT))  # utils.py always from repo root
+
+    for mod in ("myalgorithm", "baseline_greedy", "xpress_reinsert", "cpsat_reinsert"):
+        sys.modules.pop(mod, None)  # never trust a stale import from a prior code_dir in-process
+    import myalgorithm
+    from utils import check_feasibility
+
     commit = _git_commit()
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     history = _load_history()
@@ -137,11 +158,13 @@ def run(timelimit: float, label: str) -> None:
     for row in history:
         by_instance.setdefault(row["instance"], []).append(row)
 
-    print(f"Canary quality check -- commit={commit}  timelimit={timelimit:.0f}s  label={label!r}")
+    print(f"Canary quality check -- code_version={version_label}  commit={commit}  "
+          f"timelimit={timelimit:.0f}s  label={label!r}")
     print(f"History file: {CANARY_HISTORY_PATH}\n")
 
     any_regression = False
-    for entry in CANARY_SET:
+    active_set = [e for e in CANARY_SET if e["instance"] == only] if only else CANARY_SET
+    for entry in active_set:
         name = entry["instance"]
         path = _find_instance_path(name)
         with open(path, encoding="utf-8") as f:
@@ -155,8 +178,8 @@ def run(timelimit: float, label: str) -> None:
         objective = result["objective"] if feasible else None
 
         row = {
-            "timestamp": timestamp, "commit": commit, "instance": name,
-            "target": entry["target"], "confidence": entry["confidence"],
+            "timestamp": timestamp, "commit": commit, "code_version": version_label,
+            "instance": name, "target": entry["target"], "confidence": entry["confidence"],
             "timelimit": timelimit, "elapsed": elapsed,
             "feasible": feasible, "objective": objective, "label": label,
         }
@@ -200,8 +223,16 @@ if __name__ == "__main__":
                         help="free-text tag for this run (e.g. 'before grid filter')")
     parser.add_argument("--history", action="store_true",
                         help="print recorded history for all canary instances and exit (no run)")
+    parser.add_argument("--code-dir", type=str, default=None,
+                        help="run an OLD code snapshot instead of the working tree, e.g. "
+                             "submissions/submission_20260723_1250 (must contain myalgorithm.py/"
+                             "baseline_greedy.py/xpress_reinsert.py; utils.py always comes from "
+                             "the repo root, matching how the grading server treats submissions)")
+    parser.add_argument("--only", type=str, default=None,
+                        help="run just one canary instance by name (e.g. prob_34) -- for fast "
+                             "bisection iterations instead of the full 8-instance set")
     args = parser.parse_args()
     if args.history:
         _print_history_table(_load_history())
     else:
-        run(args.timelimit, args.label)
+        run(args.timelimit, args.label, args.code_dir, args.only)

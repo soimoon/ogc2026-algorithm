@@ -323,3 +323,50 @@ x4/x8/x16 합성 스트레스 인스턴스로 위 5가지 가설을 검증하는
 **수정**: 두 주입 지점 모두, 대상 bay의 기존 점유 블록에 대해 배치-쌍별 충돌 검사와 동일한 `check_collisions`+`_crane_conflict` 조합으로 사전 검증(`_cross_candidate_blocked_by_existing`)하고, 위반 시 후보 자체를 스킵하도록 수정. **검증**: `equiv_cpsat_vs_xpress.py` INFEASIBLE-MISMATCH 2건 -> 0건(남은 8건은 전부 benign한 OBJ-MISMATCH), 40개 로컬 로버스트 40/40. `experiment/reinsert-candidate-existing-block-safety` -> main merge. (자세한 내용은 `notes/algorithm_overview.md` #77)
 
 **다음 단계**: K=25/50/100+ 스케일링 실측(Xpress vs CP-SAT interleaved)으로 복귀. CP-SAT 쪽 `_left_justify` 후처리 연동은 그 이후.
+
+## 2026-07-24 (계속): P3 회귀 서브원인 전수 조사 -- 6개 전부 무죄, 진짜 TLE 버그는 별도로 발견
+
+`#75`(9a5e62b)에서 5→6차 P3 회귀를 `b621af5`로 좁혔지만 정확한 서브원인은 미확정으로 종결했었음. 오늘
+나머지 서브변경들을 마저 테스트: `_improve`의 `known_result` 재사용, `_repair`의 78% 컷오프+최종보장
+강제배치를 각각 되돌려 prob_14에서 비교 -- 둘 다 `known_result=None`/컷오프 원복 상관없이 1,579,009로
+완전히 동일(효과 없음). prob_34에서도 재검증했지만 이 인스턴스 자체의 노이즈 대역(1.8M~2.4M) 안에 묻힘.
+
+코드를 다시 읽다가 `b621af5`에 이전에 개별 테스트된 적 없던 서브변경이 하나 더 있다는 걸 발견:
+`_try_rebalance_move`(Z2/balance 연산자)에 `max_source_blocks=XPRESS_CANDIDATE_MAX_SOURCE_BLOCKS`/
+`CANDIDATE_SCAN_CAP=50` 상한이 이 커밋에서 처음 추가됐음(이전엔 완전 무제한 탐색). Z2/balance 연산자를
+직접 제한하는 변경이라 low-w1/high-w3 계열(prob_32/34/37, 실제 P3/P6 가설)에 특히 불리할 수 있다는
+가설을 세우고 `../ogc-bisect-wt` 워크트리에서 이 캡만 제거(무제한 탐색으로 복원)하고 prob_32/34를
+120초로 재실행: **prob_32 5,614,370(직전 기록 5,336,768 대비 오히려 +5.2% 악화), prob_34 2,302,108
+(직전 기록 2,143,762 대비 +7.4% 악화)** -- 둘 다 각 인스턴스의 기존 노이즈 대역 안이거나 그보다 나쁜
+쪽, 개선 신호 전혀 없음.
+
+`b621af5` 외 5→6차 구간의 나머지 커밋들도 직접 코드 리뷰: `b859b90`(same-bay-first A/B 토글, 검증만),
+`8def8be`(check_feasibility 중복 제거+bbox 캐싱), `17dcde9`(scan budget 연속 램프), `7249640`(안전마진
+확장), `31edf47`(Block.bounding_rect 클래스 레벨 캐싱, per-instance 어트리뷰트라 인스턴스 간 오염
+불가능) -- 전부 커밋 메시지의 자체 검증(40개 로버스트, 결함주입 테스트 등)으로 봤을 때 저위험. `1299ffe`/
+`4adccef`(MaxRects orientation 공유, Phase1 예산 적응)는 이미 기존 6↔7차 diff 분석으로 <300블록
+인스턴스에 완전히 gated돼있음이 확인된 것들이라 재확인 불필요.
+
+가장 유력해 보였던 건 `2ae6d86`(Phase 3 accept confirm을 매번→10회 배치, mismatch 시 최대 9라운드
+롤백): objective 자체는 매번 처음부터 O(n) 전체 재계산이라 드리프트 없음이 코드 확인으로 밝혀졌지만,
+mismatch 발생 시 배치 전체 롤백이라 발생 빈도가 조금만 높아도 low-w1/high-w3 인스턴스에서 유독 탐색
+시간을 더 많이 깎아먹을 수 있다는 메커니즘은 남아있어서, 노이즈 낀 목적함수값 대신 **기존 코드가 이미
+찍고 있는 `INCREMENTAL-CHECK MISMATCH` 로그 발생 횟수를 직접 계측**(prob_32/34, 120초): **둘 다 0회
+발동**. 노이즈 없는 결정적 측정이라 이 서브변경도 깔끔하게 배제.
+
+**결론**: `b621af5`의 6개 서브변경(이전 세션 3개 + 오늘 3개) 전부 개별로는 P3 회귀를 설명 못 함. 남은
+가능성은 (a) 여러 변경의 복합효과(개별로는 무해하지만 함께 작용할 때만 발현), (b) 애초에 `b621af5`로
+좁힌 이진탐색 자체가 그날 이후 발견된 시스템 노이즈(장시간 방치된 `find` 프로세스 등, 오늘 세션 메모리
+`feedback_check_processes_before_tests` 참조)에 오염됐을 가능성 -- 둘 다 다음 세션 과제로 이월.
+
+**별개로 발견한 진짜 버그**: 9차 제출 전 관례적인 40개 로버스트니스(20초)를 다시 돌리다 `prob_6`이 36.1초
+(20초 예산 대비 +16.1초)를 써서 시간 초과로 표시됨. `#79`에서 그리드 필터+기하 캐시 반영 후 나왔던
+"2건 시간 초과, 재실행하니 재현 안 됨 -> 노이즈로 판단"이 실은 이 버그였을 가능성이 있음(정정 필요).
+TIMING 로그로 추적하니 원인은 `xpress_reinsert.py`의 쌍별 충돌 제약 구성 루프 -- 근접쌍을 찾는
+`bucket_candidate_pairs_by_grid`는 deadline을 주기적으로 체크하지만, 그 결과를 소비해서 실제 MIP 제약을
+만드는 후속 루프에는 체크가 전혀 없었음(경합 bay에서 후보가 조밀하게 뭉치면 `close_pairs`가 매우 커지고,
+`geometry_cache` 미스마다 진짜 Shapely 호출이 걸림 -- 그리드 필터 자체의 알려진 약점과 같은 조건).
+그리드 헬퍼와 동일 주기(500)로 이 루프에도 deadline 체크 추가, 걸리면 기존 계약대로 `None` 반환(호출자는
+이미 순차 재삽입 폴백 보유). **검증**: prob_6 단독 18.0s(초과 0), 40개 전체 재실행 40/40 feasible·0
+시간 초과(새 체크가 실제로 5회 발동 -- prob_6 하나만의 우연이 아니었음). 이 수정을 포함한 코드로
+`submissions/submission_20260724_1332.zip`(9차) 패키징 완료.

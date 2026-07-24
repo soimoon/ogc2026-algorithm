@@ -93,6 +93,17 @@ CROSS_INJECT_MAX_K = 5
 # out genuinely-plausible swaps.
 CROSS_INJECT_SIZE_SLACK = 1.3
 
+# 2026-07-24 bugfix: how often (in constraint pairs processed) the main
+# conflict-construction loop below re-checks `deadline` -- see that loop's
+# own comment for why this exists (bucket_candidate_pairs_by_grid checks
+# the deadline while DISCOVERING close pairs, but the loop that actually
+# consumes them to build MIP constraints previously had no check at all).
+# Same interval baseline_greedy._GRID_DEADLINE_CHECK_INTERVAL uses for the
+# analogous inner loop there -- picked for the same reason (frequent enough
+# to bound overrun to a few hundred cache-miss Shapely calls, not so
+# frequent that time.time() itself becomes measurable overhead).
+_CONFLICT_LOOP_DEADLINE_CHECK_INTERVAL = 500
+
 # 2026-07-22 (experiment/same-bay-first branch): toggle for A/B-testing
 # whether the same-bay-first fast path (see reinsert()'s call site) is
 # trapping blocks in a congested bay by never even generating an
@@ -661,7 +672,26 @@ def reinsert(remove_ids: list[int],
                 print(f"[xpress_reinsert] DEBUG bail: deadline hit during pairwise "
                       f"construction (bay={bay_id})")
                 return None
-            for (bi, ci), (bj, cj) in close_pairs:
+            for _pair_idx, ((bi, ci), (bj, cj)) in enumerate(close_pairs):
+                # 2026-07-24 bugfix: bucket_candidate_pairs_by_grid checks
+                # `deadline` while DISCOVERING close_pairs, but this loop --
+                # which actually consumes them, including geometry_cache
+                # misses that trigger fresh Shapely check_collisions/
+                # check_entry calls -- previously had no check at all.
+                # Confirmed via analysis/robustness_check.py: a single
+                # congested bay (dense candidate cluster defeats the grid
+                # filter's "skip far pairs" premise, see module docstring)
+                # produced a close_pairs list whose consumption alone took
+                # 22s past this reinsert() call's deadline (prob_6, K=19
+                # batch). Same interval/rationale as the grid helper's own
+                # periodic check.
+                if (deadline is not None
+                        and _pair_idx % _CONFLICT_LOOP_DEADLINE_CHECK_INTERVAL == 0
+                        and time.time() > deadline):
+                    print(f"[xpress_reinsert] DEBUG bail: deadline hit during conflict-"
+                          f"constraint construction (bay={bay_id}, {_pair_idx}/"
+                          f"{len(close_pairs)} pairs processed)")
+                    return None
                 if bi == bj:
                     continue  # same block's own candidates already mutually exclusive
                 _, bay_i, cx_i, cy_i, oi_i, entry_i, exit_i = per_block[bi][ci]
