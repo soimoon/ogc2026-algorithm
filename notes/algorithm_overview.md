@@ -603,6 +603,33 @@
     **검증**: 로컬 40개 로버스트니스(20초 예산) 재실행으로 회귀/크래시 없음 확인 -- 자세한 수치는
     `notes/experiments.md` 해당 날짜 항목 참조.
 
+82. **4코어 병렬 재시작(계층형+island+가중치 적응형 alt 슬롯) + reorder 오퍼레이터, main 병합 (2026-07-25)**
+    **배경**: 코드베이스가 대회 허용 4 CPU 코어 중 0개만 쓰고 있었음을 발견, `multiprocessing`으로
+    N-독립-파이프라인 병렬 재시작 -> 계층형 공유(EDD construction 1회 + Phase3만 N개로 팬아웃) ->
+    island-model 마이그레이션(Phase3 예산을 세그먼트로 나눠 매 라운드 전역 최선으로 재동기화)까지 구현.
+    9차 제출본과의 실제 A/B(90초x2회, 캐너리 6개)에서 계층형 구조가 prob_1(8.5배), prob_18(11%) 회귀를
+    일으킴을 발견 -- 공유 EDD construction을 seed=0 하나로만 고정하는데, `_iterated_greedy`를 직접
+    돌려보니 두 인스턴스 모두 정답 basin이 다른 priority_rule이 아니라 **같은 edd, 다른 seed(seed=1,
+    두 번째 restart)**에서 나옴을 실증 -- "EDD는 seed 무관하게 거의 같은 곳에 수렴한다"는 계층형 설계의
+    전제 자체가 틀렸음.
+    **하이브리드 alt 슬롯 (3단계 진화)**: 워커 슬롯 1개를 독립 alt-construction에 예약.
+    v1(alt=area_slack 단일 시도)은 6개 캐너리 2승4패->3승3패로 개선했지만 prob_1/18은 못 고침(다른
+    rule 1회로는 "같은 rule 다른 seed" 문제를 못 잡음). v2(alt=`_iterated_greedy` restart-loop을
+    그대로 재사용하는 `_alt_restart_entry`)는 prob_1/18을 9차 제출본과 정확히 일치시켜 회귀를 완전
+    해소했지만, w3 비중이 다른 캐너리보다 10~20배 높은(P3/P6 추정) prob_32/34를 새로 회귀시킴(최대
+    -31%) -- edd 위주 restart-loop이 Z1 basin만 찾고, w3 비중이 큰 인스턴스엔 그 코어를 tiered/island
+    Phase-3에 쓰는 게 더 유리함. v3는 `w3_share = w3/(w1+w2+w3)` 임계값(5%)으로 alt 슬롯 전략 자체를
+    인스턴스별로 분기(w3_share<5%: restart-loop, >=5%: area_slack 단일 시도) -- 6개 캐너리 최종
+    **4승 0패 2무**(prob_1/18 고정=회귀 해소 유지, prob_14/32/34/40 개선, prob_32 +25.5%).
+    **병합**: `experiment/reorder-operator`(시간축 전용 위상 탐색 ALNS 오퍼레이터, 별도 세션에 40/40
+    로버스트+1승3저신뢰패 검증 완료)와 함께 `main`에 병합 -- `baseline_greedy.py`에서 auto-merge, 코드
+    충돌 없음.
+    **검증**: 병합 직후 40개 로컬 로버스트니스(10초 예산, 두 기능이 한 파일에서 함께 도는 첫 시험)
+    40/40 feasible, 0 크래시, 0 시간초과. 단, 병합된 조합 자체의 품질(목적함수) 비교는 각 기능을 개별
+    검증했을 뿐 아직 미실시 -- 10차가 마지막 제출이 아니므로 다음 세션으로 이월(자세한 수치는
+    `notes/experiments.md` 해당 날짜 항목 참조). `submissions/submission_20260725_0146.zip`(10차)
+    패키징 완료.
+
 ---
 
 ## 3. 시간이 있다면 더 해볼 수 있는 것들

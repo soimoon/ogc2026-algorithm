@@ -370,3 +370,33 @@ TIMING 로그로 추적하니 원인은 `xpress_reinsert.py`의 쌍별 충돌 �
 이미 순차 재삽입 폴백 보유). **검증**: prob_6 단독 18.0s(초과 0), 40개 전체 재실행 40/40 feasible·0
 시간 초과(새 체크가 실제로 5회 발동 -- prob_6 하나만의 우연이 아니었음). 이 수정을 포함한 코드로
 `submissions/submission_20260724_1332.zip`(9차) 패키징 완료.
+
+## 2026-07-25 -- 4코어 병렬 재시작(계층형+island+적응형 alt 슬롯) + reorder 오퍼레이터, 10차 패키징
+
+9차 채점 대기 중 코드베이스가 대회 허용 4코어 중 0개만 쓰고 있다는 걸 발견, 병렬화를 이번 세션의
+주 작업으로 삼음. N-독립-파이프라인 병렬 재시작 -> 계층형 공유(EDD construction 1회 + Phase3만
+팬아웃) -> island-model 마이그레이션(세그먼트별 전역 최선 재동기화)까지 구현/검증했으나, 실제
+9차 제출본(`submission_20260724_1332`) 코드와의 A/B(90초×2회, 캐너리 6개)에서 prob_1(8.5배),
+prob_18(11%) **회귀**를 발견 -- 계층형 구조는 공유 EDD construction을 seed=0 하나로만 고정하는데,
+`_iterated_greedy`를 직접 돌려 확인해보니 두 인스턴스 모두 정답 basin이 "다른 priority_rule"이
+아니라 **같은 edd, 다른 seed(seed=1, 두 번째 restart)**에서 나옴 -- Phase-1 EDD construction이
+seed-invariant라는 계층형 설계의 전제 자체가 틀렸음을 실증.
+
+1슬롯을 독립 alt-construction에 예약하는 하이브리드 수정을 3단계로 진화시킴:
+- **v1** (alt=area_slack 단일 시도): 6개 캐너리 2승4패->3승3패로 개선됐지만 prob_1/18은 전혀 못 고침
+  (한 번의 다른 rule 시도로는 "같은 rule, 다른 seed" 문제를 못 잡음).
+- **v2** (alt=`_iterated_greedy` restart-loop 재사용, `_alt_restart_entry`): prob_1/18이 9차 제출본과
+  **정확히 일치**(8,041 / 174,788)하며 회귀 완전 해소. 하지만 prob_32/34(w3 비중이 다른 캐너리보다
+  10~20배 높은, P3/P6 추정 인스턴스)가 새로 회귀(prob_34 최대 -31%, 기존 노이즈 대역 크게 벗어남) --
+  edd 위주 restart-loop이 Z1 basin만 찾고, w3 비중이 큰 인스턴스엔 그 코어를 tiered/island Phase-3에
+  쓰는 게 더 나음.
+- **v3** (`w3_share = w3/(w1+w2+w3)` 기반 적응형 분기, 임계값 5%): w3_share<5%면 v2의 restart-loop,
+  ≥5%면 v1의 area_slack 단일 시도로 alt 슬롯 전략 자체를 인스턴스별로 전환. 6개 캐너리 최종 결과
+  **4승 0패 2무** (prob_1/18 고정=회귀 해소 유지, prob_14/32/34/40 개선, prob_32는 +25.5%).
+
+`experiment/reorder-operator`(시간축 전용 위상 탐색 ALNS 오퍼레이터, 이전 세션에 40/40 로버스트+
+1승3저신뢰패 검증 완료)와 함께 `main`에 병합 -- `baseline_greedy.py`에서 auto-merge, 충돌 없음.
+병합 직후 재검증한 40개 로버스트니스(10초, 두 기능이 한 파일에서 함께 도는 첫 시험) 40/40 feasible·
+0 crash·0 시간초과. **다만 두 기능을 합친 조합의 품질(목적함수) 비교는 아직 미실시** -- 사용자 결정으로
+10차가 마지막 제출이 아니므로 우선 패키징하고 다음 세션에 시간 여유 두고 진행하기로 함.
+`submissions/submission_20260725_0146.zip`(10차) 패키징 완료.
